@@ -1,0 +1,15 @@
+# Основные настройки wifi-monitor
+db_path: data/wifi_monitor.db
+kismet_db_path: data/kismet.kismet
+targets_path: config/ap_targets.yaml
+
+# GPS-демон
+gps_host: 127.0.0.1
+gps_port: 2947
+
+# Синхронизация данных из Kismet
+sync_interval_sec: 30
+
+# Логирование
+log_level: INFO
+log_file: data/wifi_monitor.log
