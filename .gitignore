@@ -1,0 +1,37 @@
+# === Виртуальное окружение ===
+.venv/
+venv/
+ENV/
+
+# === Файлы данных и логи (Kismet / WiGle / Дампы) ===
+# Игнорируем логи и собранные данные в директории data
+data/*.log
+data/*.kismet
+data/*.wiglecsv
+
+# Если в корне случайно появятся файлы дампов или логов
+*.log
+*.kismet
+*.wiglecsv
+
+# Исключение для .gitkeep, чтобы пустая папка data оставалась в Git
+!data/.gitkeep
+!export/.gitkeep
+
+# === Кэш Python и скомпилированные файлы ===
+__pycache__/
+*.py[cod]
+*$py.class
+src/__pycache__/
+tests/__pycache__/
+
+# === Кэш инструментов тестирования ===
+.pytest_cache/
+.htmlcov/
+htmlcov/
+.coverage
+.coverage.*
+
+# === Системные файлы и временный мусор ===
+.DS_Store
+Thumbs.db

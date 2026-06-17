@@ -8,8 +8,10 @@ src/kismet_runner.py
 Используется из src/cli.py (режимы 1 и 3).
 """
 
+import glob
 import json
 import logging
+import os
 import sqlite3
 import subprocess
 import time
@@ -44,15 +46,37 @@ def _extract_blob(device_json):
     Возвращает словарь с полями ssid, encryption, manufacturer.
     При ошибке парсинга возвращает словарь с None-значениями.
     """
-    empty = {"ssid": None, "encryption": None, "manufacturer": None}
+    empty = {
+        "ssid": None, "encryption": None,
+        "manufacturer": None, "channel": None, "frequency": None,
+    }
     if not device_json:
         return empty
     try:
         blob = json.loads(device_json)
+        # channel может быть строкой ("6") или числом — приводим к int
+        raw_channel = blob.get("kismet.device.base.channel")
+        try:
+            channel = int(raw_channel) if raw_channel is not None else None
+        except (ValueError, TypeError):
+            channel = None
+
+        raw_freq = blob.get("kismet.device.base.frequency")
+        try:
+            frequency = float(raw_freq) if raw_freq is not None else None
+        except (ValueError, TypeError):
+            frequency = None
+
+        # frequency хранится в кГц (например 2412000) — переводим в МГц
+        if frequency is not None:
+            frequency = frequency / 1000.0
+
         return {
             "ssid":         blob.get("kismet.device.base.commonname"),
-            "encryption":   blob.get("kismet.device.base.crypt_string"),
+            "encryption":   blob.get("kismet.device.base.crypt"),   # не crypt_string
             "manufacturer": blob.get("kismet.device.base.manuf"),
+            "channel":      channel,
+            "frequency":    frequency,
         }
     except (json.JSONDecodeError, TypeError) as exc:
         logger.warning("Не удалось распарсить JSON blob устройства: %s", exc)
@@ -74,51 +98,120 @@ def _coords_valid(lat, lon):
 # Публичный API
 # ---------------------------------------------------------------------------
 
-def start_kismet(monitor_iface, kismet_db_path, log_dir="data/"):
+def find_kismet_db(log_dir="data/", title="wardrive"):
+    """
+    Находит самый свежий .kismet файл в log_dir с заданным title.
+    Kismet создаёт базы по схеме: <log_dir><title>-YYYYMMDD-HH-MM-SS-N.kismet
+    Возвращает путь к файлу или None если не найден.
+    """
+    pattern = os.path.join(log_dir, "{}-*.kismet".format(title))
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    # Берём самый свежий по времени изменения
+    return max(matches, key=os.path.getmtime)
+
+
+def start_kismet(monitor_iface, log_dir="data/", title="wardrive"):
     """
     Запускает Kismet как фоновый процесс в wardrive-режиме.
 
-    Ждёт 3 секунды и проверяет что процесс жив.
-    Возвращает объект Popen.
-    Бросает RuntimeError если Kismet упал сразу после запуска.
+    Kismet сам генерирует имя базы: <log_dir><title>-YYYYMMDD-HH-MM-SS-1.kismet
+    После старта находит созданный файл через find_kismet_db().
+
+    Возвращает кортеж (proc, kismet_db_path).
+    Бросает RuntimeError если Kismet упал или база не создалась.
     """
-    import os
     os.makedirs(log_dir, exist_ok=True)
+
+    # --daemonize НЕ используем: launcher завершится с кодом 0 и мы потеряем proc.
+    # --override wardrive включает kismetdb-логирование и отключает pcap.
+    # --log-types НЕ используем: в разных версиях Kismet этот флаг ведёт себя
+    #   непредсказуемо и может конфликтовать с --override wardrive.
+    # --log-prefix передаём как абсолютный путь, чтобы Kismet не искал файл
+    #   относительно своего рабочего каталога.
+    abs_log_dir = os.path.abspath(log_dir)
+    if not abs_log_dir.endswith(os.sep):
+        abs_log_dir += os.sep
 
     cmd = [
         "kismet",
         "-c", monitor_iface,
         "--no-ncurses",
-        "--daemonize",
-        "--kismetdb", kismet_db_path,
         "--override", "wardrive",
-        "--log-prefix", log_dir,
+        "--log-prefix", abs_log_dir,
+        "--log-title", title,
     ]
+
+    # stdout/stderr в файлы: при PIPE Python блокируется если буфер переполнится
+    stdout_log = os.path.join(log_dir, "kismet_stdout.log")
+    stderr_log = os.path.join(log_dir, "kismet_stderr.log")
+
     logger.info("Запуск Kismet: %s", " ".join(cmd))
+    logger.info("Логи Kismet: %s / %s", stdout_log, stderr_log)
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        fout = open(stdout_log, "w")
+        ferr = open(stderr_log, "w")
+        proc = subprocess.Popen(cmd, stdout=fout, stderr=ferr)
     except FileNotFoundError:
         raise RuntimeError("Kismet не найден. Установите: sudo apt install kismet")
 
-    # Даём Kismet время инициализироваться
-    time.sleep(3)
+    # Kismet создаёт файл базы при первой записи (интервал до 30 сек).
+    # Ждём до 45 сек, проверяя каждые 2 сек. Ищем файл как в log_dir,
+    # так и в ~/.kismet/ — Kismet иногда игнорирует --log-prefix
+    # и пишет туда по умолчанию.
+    fallback_dirs = [
+        os.path.abspath(log_dir),
+        os.path.expanduser("~/.kismet"),
+        os.path.expanduser("~/kismet"),
+        os.getcwd(),
+    ]
+    db_path = None
+    max_attempts = 23  # 23 × 2 сек ≈ 45 сек
+    for attempt in range(max_attempts):
+        time.sleep(2)
+        if proc.poll() is not None:
+            try:
+                stderr_text = open(stderr_log).read().strip()
+            except OSError:
+                stderr_text = "(лог недоступен)"
+            raise RuntimeError(
+                "Kismet завершился при старте (код {}): {}".format(
+                    proc.returncode, stderr_text
+                )
+            )
+        # Ищем файл во всех возможных местах
+        for search_dir in fallback_dirs:
+            found = find_kismet_db(search_dir, title)
+            if found:
+                db_path = found
+                break
+        if db_path:
+            logger.info(
+                "База Kismet создана: %s (попытка %d/%d)",
+                db_path, attempt + 1, max_attempts
+            )
+            break
+        if attempt % 5 == 0:
+            logger.info(
+                "Ожидание базы Kismet... %d/%d сек",
+                (attempt + 1) * 2, max_attempts * 2
+            )
 
-    if proc.poll() is not None:
-        # Процесс уже завершился — что-то пошло не так
-        _, stderr = proc.communicate()
+    if not db_path:
+        proc.terminate()
+        # Сообщаем где именно искали
+        searched = ", ".join(fallback_dirs)
         raise RuntimeError(
-            "Kismet завершился сразу после запуска (код {}): {}".format(
-                proc.returncode, stderr.decode(errors="replace").strip()
+            "Kismet запущен (PID {}), но база не появилась за {} сек. "
+            "Искали в: {}. Проверьте логи: {}".format(
+                proc.pid, max_attempts * 2, searched, stderr_log
             )
         )
 
-    logger.info("Kismet запущен (PID %d), база: %s", proc.pid, kismet_db_path)
-    return proc
+    logger.info("Kismet запущен (PID %d), база: %s", proc.pid, db_path)
+    return proc, db_path
 
 
 def stop_kismet(proc):
@@ -162,7 +255,10 @@ def read_kismet_networks(kismet_db, since_ts=0.0):
         logger.warning("База Kismet не найдена: %s", kismet_db)
         return []
 
-    uri = "file:{}?mode=ro&immutable=1".format(kismet_db)
+    # mode=ro — только чтение, без immutable: Kismet держит файл открытым
+    # на запись, immutable=1 заставляет SQLite читать устаревший page cache
+    # и может приводить к пустым результатам при активной записи.
+    uri = "file:{}?mode=ro".format(kismet_db)
     try:
         conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
@@ -171,15 +267,18 @@ def read_kismet_networks(kismet_db, since_ts=0.0):
         return []
 
     try:
+        # Реальная схема таблицы devices (проверено на живой базе Kismet):
+        # first_time, last_time, devkey, phyname, devmac, strongest_signal,
+        # min_lat, min_lon, max_lat, max_lon, avg_lat, avg_lon, bytes_data, type, device
+        # Колонок min_channel/max_channel/min_freq/max_freq нет —
+        # канал и частота берутся из JSON blob.
         rows = conn.execute(
             """
             SELECT devmac,
-                   avg_lat,    avg_lon,
-                   min_lat,    min_lon,
-                   max_lat,    max_lon,
-                   best_signal,
-                   min_freq,   max_freq,
-                   min_channel, max_channel,
+                   avg_lat,  avg_lon,
+                   min_lat,  min_lon,
+                   max_lat,  max_lon,
+                   strongest_signal,
                    first_time, last_time,
                    device
             FROM   devices
@@ -188,6 +287,7 @@ def read_kismet_networks(kismet_db, since_ts=0.0):
             """,
             (int(since_ts),),
         ).fetchall()
+        logger.debug("SQL вернул %d строк из базы Kismet", len(rows))
     except sqlite3.Error as exc:
         logger.error("Ошибка SQL при чтении базы Kismet: %s", exc)
         conn.close()
@@ -210,14 +310,14 @@ def read_kismet_networks(kismet_db, since_ts=0.0):
                 "ssid":         blob_data["ssid"],
                 "encryption":   blob_data["encryption"],
                 "manufacturer": blob_data["manufacturer"],
-                # Берём минимальный канал (обычно он один и тот же)
-                "channel":   row["min_channel"] or row["max_channel"],
-                "frequency": row["min_freq"] or row["max_freq"],
-                "first_seen": _ts_to_iso(row["first_time"]),
-                "last_seen":  _ts_to_iso(row["last_time"]),
-                "best_lat":   lat if _coords_valid(lat, lon) else None,
-                "best_lon":   lon if _coords_valid(lat, lon) else None,
-                "best_signal": row["best_signal"],
+                # channel и frequency — только в JSON blob, не в отдельных колонках
+                "channel":      blob_data.get("channel"),
+                "frequency":    blob_data.get("frequency"),
+                "first_seen":   _ts_to_iso(row["first_time"]),
+                "last_seen":    _ts_to_iso(row["last_time"]),
+                "best_lat":     lat if _coords_valid(lat, lon) else None,
+                "best_lon":     lon if _coords_valid(lat, lon) else None,
+                "best_signal":  row["strongest_signal"],
             })
         except Exception as exc:
             logger.warning(
@@ -317,48 +417,75 @@ if __name__ == "__main__":
     import sys
 
     USAGE = """
-Использование (вспомогательный запуск, не требует Kismet):
-
-  python -m src.kismet_runner read <kismet_db> [since_ts]
-      Прочитать сети из базы Kismet и вывести их в stdout.
-      since_ts — unix timestamp, читать только записи новее него (default: 0)
-
-Примеры:
-  python -m src.kismet_runner read data/kismet.kismet
-  python -m src.kismet_runner read data/kismet.kismet 1700000000
-
-Управление процессом Kismet производится через src/cli.py:
-  sudo python -m src.cli --mode 1 --monitor wlan0
+Использование для тестирования:
+  sudo python3 -m src.kismet_runner <интерфейс_монитора> [папка_логов]
+Пример:
+  sudo python3 -m src.kismet_runner wlan0mon data/
 """.strip()
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if len(sys.argv) < 3 or sys.argv[1] != "read":
+    if len(sys.argv) < 2:
         print(USAGE)
-        sys.exit(0)
+        sys.exit(1)
 
-    db_path = sys.argv[2]
-    ts = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    monitor_iface = sys.argv[1]
+    # Если папка не задана — по умолчанию data/
+    log_dir = sys.argv[2] if len(sys.argv) > 2 else "data/"
+    kismet_db_path = None
+    proc = None
 
-    nets = read_kismet_networks(db_path, since_ts=ts)
-    if not nets:
-        print("Сетей не найдено (база пуста или файл не существует).")
-        sys.exit(0)
+    try:
+        # 1. Запуск Kismet
+        logger.info("=== ШАГ 1: Запуск Kismet на интерфейсе %s ===", monitor_iface)
+        # start_kismet возвращает (proc, db_path) — Kismet сам генерирует имя файла
+        proc, kismet_db_path = start_kismet(monitor_iface=monitor_iface, log_dir=log_dir)
 
-    print("Найдено сетей: {}".format(len(nets)))
-    print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
-        "BSSID", "SSID", "Шифр.", "Канал", "Шир.", "Долг."
-    ))
-    print("-" * 90)
-    for n in nets:
-        print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
-            n["bssid"] or "",
-            (n["ssid"] or "")[:31],
-            (n["encryption"] or "")[:9],
-            str(n["channel"] or ""),
-            str(round(n["best_lat"], 5)) if n["best_lat"] else "",
-            str(round(n["best_lon"], 5)) if n["best_lon"] else "",
-        ))
+        # 2. Сбор данных
+        scan_duration = 15
+        logger.info("=== ШАГ 2: Ждем %d секунд, пока Kismet собирает сети... ===", scan_duration)
+        for i in range(scan_duration, 0, -1):
+            sys.stdout.write("\rОсталось времени сборки: {} сек... ".format(i))
+            sys.stdout.flush()
+            time.sleep(1)
+        print("\n")
+
+    except KeyboardInterrupt:
+        logger.info("\nТест прерван пользователем (Ctrl+C)")
+    except Exception as e:
+        logger.error("Произошла ошибка во время теста: %s", e)
+    finally:
+        # 3. Сначала останавливаем Kismet — он сбрасывает все данные на диск
+        if proc is not None:
+            logger.info("=== ШАГ 3: Остановка Kismet (сброс данных на диск) ===")
+            stop_kismet(proc)
+            proc = None
+
+    # 4. Читаем базу только после остановки — все данные уже на диске
+    if kismet_db_path:
+        logger.info("=== ШАГ 4: Чтение базы Kismet: %s ===", kismet_db_path)
+        nets = read_kismet_networks(kismet_db_path, since_ts=0.0)
+
+        if not nets:
+            logger.warning("Сетей не найдено. Проверьте что интерфейс был в monitor mode.")
+        else:
+            print("\n" + "=" * 90)
+            print("РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ (Найдено сетей: {})".format(len(nets)))
+            print("=" * 90)
+            print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
+                "BSSID", "SSID", "Шифр.", "Канал", "Шир.", "Долг."
+            ))
+            print("-" * 90)
+            for n in nets:
+                print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
+                    n["bssid"] or "",
+                    (n["ssid"] or "")[:31],
+                    (n["encryption"] or "")[:9],
+                    str(n["channel"] or ""),
+                    str(round(n["best_lat"], 5)) if n["best_lat"] else "No GPS",
+                    str(round(n["best_lon"], 5)) if n["best_lon"] else "No GPS",
+                ))
+            print("=" * 90 + "\n")
