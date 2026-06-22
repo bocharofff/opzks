@@ -9,6 +9,8 @@ data/*.log
 data/*.kismet
 data/*.wiglecsv
 
+export/*.csv
+
 # Если в корне случайно появятся файлы дампов или логов
 *.log
 *.kismet
