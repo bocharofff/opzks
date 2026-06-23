@@ -6,6 +6,10 @@ src/ap_checker.py
 ассоциируется, получает IP через DHCP, проверяет выход в интернет.
 
 Используется из src/cli.py (режимы 2 и 3).
+
+Механизм ассоциации: wpa_supplicant (-B -P pidfile) + wpa_cli -a action-скрипт.
+Action-скрипт реагирует на событие CONNECTED, поднимает интерфейс и запускает
+dhclient. Скрипт поллит появление IP-адреса и nameserver в resolv.conf.
 """
 
 import logging
@@ -26,8 +30,22 @@ logger = logging.getLogger(__name__)
 _DEFAULTS = {
     "check_url":       "http://connectivitycheck.gstatic.com/generate_204",
     "check_timeout_s": 10,
-    "dhcp_timeout_s":  20,
+    "dhcp_timeout_s":  30,
 }
+
+# action-скрипт для wpa_cli -a.
+# wpa_cli вызывает его с аргументами: <iface> <event>.
+# event = CONNECTED при успешной ассоциации, DISCONNECTED при разрыве.
+_WPA_ACTION_SCRIPT = """#!/bin/bash
+IFACE="$1"
+CMD="$2"
+logger "wpa_action: iface=$IFACE cmd=$CMD"
+if [ "$CMD" = "CONNECTED" ]; then
+    ip link set "$IFACE" up
+    dhclient -r "$IFACE" 2>/dev/null
+    dhclient -v "$IFACE"
+fi
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +162,7 @@ class APChecker:
     def _write_wpa_conf(self, ap):
         """
         Создаёт временный wpa_supplicant.conf для точки ap.
+        Формат идентичен рабочему test_wpa2.conf.
         Устанавливает права 600. Возвращает путь к файлу.
         Содержимое файла (и пароли) НИКОГДА не логируются.
         """
@@ -164,9 +183,15 @@ class APChecker:
         if security == "open":
             auth_block = "\tkey_mgmt=NONE\n"
         elif security == "wpa2-psk":
-            auth_block = "\tkey_mgmt=WPA-PSK\n\tproto=RSN\n\tpairwise=CCMP\n"
+            # group=CCMP добавлен явно — как в рабочем test_wpa2.conf
+            auth_block = (
+                "\tkey_mgmt=WPA-PSK\n"
+                "\tproto=RSN\n"
+                "\tpairwise=CCMP\n"
+                "\tgroup=CCMP\n"
+            )
         elif security == "wpa3-sae":
-            auth_block = "\tkey_mgmt=SAE\n\tieee80211w=2\n"
+            auth_block = "\tkey_mgmt=SAE\n\tieee80211w=1\n"
         elif security == "wpa2-eap":
             auth_block = "\tkey_mgmt=WPA-EAP\n\tproto=RSN\n"
             # TODO: добавить eap= identity= password= по необходимости
@@ -180,8 +205,11 @@ class APChecker:
         if hidden:
             optional += "\tscan_ssid=1\n"
 
+        # ctrl_interface и group — как в рабочем конфиге (путь + group=0,
+        # а не DIR=... GROUP=netdev)
         conf = (
-            "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n"
+            "ctrl_interface=/var/run/wpa_supplicant\n"
+            "ctrl_interface_group=0\n"
             "network={{\n"
             "\tssid=\"{ssid}\"\n"
             "{auth}{psk}{optional}"
@@ -204,12 +232,34 @@ class APChecker:
         return path
 
     # ------------------------------------------------------------------
+    # Генерация action-скрипта для wpa_cli
+    # ------------------------------------------------------------------
+
+    def _write_action_script(self):
+        """
+        Создаёт временный action-скрипт для wpa_cli -a.
+        Права 700 (исполняемый). Возвращает путь.
+        """
+        fd, path = tempfile.mkstemp(suffix=".sh", prefix="wpa_action_")
+        try:
+            os.write(fd, _WPA_ACTION_SCRIPT.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o700)
+        logger.debug("action-скрипт создан: %s", path)
+        return path
+
+    # ------------------------------------------------------------------
     # Проверка одной точки
     # ------------------------------------------------------------------
 
     def check_one(self, ap):
         """
-        Полный цикл проверки одной точки.
+        Полный цикл проверки одной точки через wpa_cli -a action-скрипт.
+
+        wpa_supplicant запускается с PID-файлом, wpa_cli с action-скриптом
+        реагирует на CONNECTED и сам запускает dhclient. Мы поллим появление
+        IP-адреса как признак ассоциации + DHCP, затем готовность DNS.
 
         Возвращает dict: {ap_id, status, rtt_ms, lat, lon, timestamp}.
         psk/psk_hash НИКОГДА не включаются в результат.
@@ -219,62 +269,132 @@ class APChecker:
         check_timeout_s = int(ap.get("check_timeout_s", self._defaults["check_timeout_s"]))
         check_url       = ap.get("check_url", self._defaults["check_url"])
 
-        status   = "error"
-        rtt_ms   = None
-        conf_path = None
+        status       = "error"
+        rtt_ms       = None
+        conf_path    = None
+        action_path  = None
+        pid_path     = None
+        wpa_cli_proc = None
 
         try:
             # ----------------------------------------------------------
-            # Шаг 1: создаём wpa_supplicant.conf
+            # Шаг 1: создаём wpa_supplicant.conf и action-скрипт
             # ----------------------------------------------------------
             conf_path = self._write_wpa_conf(ap)
+            action_path = self._write_action_script()
+            pid_path = conf_path + ".pid"
 
             # ----------------------------------------------------------
-            # Шаг 2: запускаем wpa_supplicant в фоне (-B)
+            # Шаг 2: полная очистка состояния ПЕРЕД подключением,
+            #        затем запуск нового wpa_supplicant (-B -P).
+            #
+            # Без этого dhclient на следующем прогоне спотыкается на
+            # "Error: ipv4: Address already assigned" — старый IP с прошлой
+            # проверки остаётся на интерфейсе, и первый DHCP-цикл сбоит,
+            # из-за чего DNS встаёт с большой задержкой.
             # ----------------------------------------------------------
-            rc, _, stderr = _run(
-                ["wpa_supplicant", "-B", "-i", self.iface, "-c", conf_path],
+            # 2a. Гасим старый wpa_supplicant
+            _run(["killall", "wpa_supplicant"], timeout=5)
+            time.sleep(1)
+            # 2b. Удаляем осиротевший ctrl_interface сокет, иначе новый
+            #     процесс упадёт на "Failed to initialize control interface"
+            _run(["rm", "-f", "/var/run/wpa_supplicant/{}".format(self.iface)], timeout=5)
+            # 2c. Освобождаем старую DHCP-аренду (если dhclient её держит)
+            _run(["dhclient", "-r", self.iface], timeout=5)
+            # 2d. Гасим возможные осиротевшие dhclient на этом интерфейсе
+            _run(["pkill", "-f", "dhclient.*{}".format(self.iface)], timeout=5)
+            # 2e. Сбрасываем все IP-адреса с интерфейса
+            _run(["ip", "addr", "flush", "dev", self.iface], timeout=5)
+            # 2f. Поднимаем интерфейс (flush мог его не тронуть, но на всякий)
+            _run(["ip", "link", "set", self.iface, "up"], timeout=5)
+
+            rc, stdout, stderr = _run(
+                ["wpa_supplicant", "-B", "-i", self.iface,
+                 "-c", conf_path, "-P", pid_path],
                 timeout=10,
             )
             if rc != 0:
                 logger.warning(
-                    "[%s] wpa_supplicant не запустился: %s", ap_id, stderr.strip()
+                    "[%s] wpa_supplicant не запустился (rc=%d): stdout=%r stderr=%r",
+                    ap_id, rc, stdout.strip(), stderr.strip(),
                 )
                 status = "no_assoc"
                 return self._make_result(ap_id, status, rtt_ms)
 
             # ----------------------------------------------------------
-            # Шаг 3: polling ассоциации
+            # Шаг 3: запускаем wpa_cli -a в фоне (Popen, не _run).
+            # Он сам поднимет интерфейс и запустит dhclient по CONNECTED.
             # ----------------------------------------------------------
-            associated = False
+            try:
+                wpa_cli_proc = subprocess.Popen(
+                    ["wpa_cli", "-i", self.iface, "-a", action_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                logger.warning("[%s] не удалось запустить wpa_cli -a: %s", ap_id, exc)
+                status = "error"
+                return self._make_result(ap_id, status, rtt_ms)
+
+            # ----------------------------------------------------------
+            # Шаг 4: ждём появления IP (action-скрипт уже сделал dhclient)
+            # ----------------------------------------------------------
+            got_ip = False
             for _ in range(dhcp_timeout_s):
                 time.sleep(1)
-                _, out, _ = _run(["iw", "dev", self.iface, "link"], timeout=5)
-                if "Connected" in out or ("SSID" in out and "Not connected" not in out):
-                    associated = True
-                    logger.debug("[%s] Ассоциация подтверждена", ap_id)
+                _, addr_out, _ = _run(["ip", "addr", "show", self.iface], timeout=5)
+                if "inet " in addr_out:
+                    got_ip = True
+                    logger.debug("[%s] IP получен", ap_id)
                     break
 
-            if not associated:
-                logger.info("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
-                status = "no_assoc"
+            if not got_ip:
+                # Различаем "не ассоциировались" и "ассоциировались, но нет DHCP"
+                _, link_out, _ = _run(["iw", "dev", self.iface, "link"], timeout=5)
+                if "Connected" in link_out:
+                    logger.info("[%s] Ассоциация есть, но IP не получен", ap_id)
+                    status = "no_dhcp"
+                else:
+                    logger.info("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
+                    status = "no_assoc"
                 return self._make_result(ap_id, status, rtt_ms)
 
             # ----------------------------------------------------------
-            # Шаг 4: DHCP
+            # Шаг 5: ждём готовности DNS — реальной попыткой резолва.
+            #
+            # Проверка "nameserver in resolv.conf" ненадёжна: строка есть,
+            # но сервер ещё не отвечает / маршрут не готов. Резолвим сам хост
+            # тем же резолвером, что потом использует requests. Окно 25с —
+            # на реальной точке от ассоциации до рабочего DNS уходит ~15-20с.
             # ----------------------------------------------------------
-            _run(["dhclient", "-1", self.iface], timeout=dhcp_timeout_s + 5)
+            import socket
+            from urllib.parse import urlparse
 
-            _, addr_out, _ = _run(["ip", "addr", "show", self.iface], timeout=5)
-            if "inet " not in addr_out:
-                logger.info("[%s] IP не получен (нет DHCP)", ap_id)
-                status = "no_dhcp"
+            check_host = urlparse(check_url).hostname or ""
+            logger.debug("[%s] IP получен, ждём резолва %s...", ap_id, check_host)
+
+            dns_ready = False
+            for _ in range(25):
+                time.sleep(1)
+                try:
+                    socket.gethostbyname(check_host)
+                    dns_ready = True
+                    logger.debug("[%s] DNS резолвит %s", ap_id, check_host)
+                    break
+                except socket.gaierror:
+                    continue
+
+            if not dns_ready:
+                _, resolv, _ = _run(["cat", "/etc/resolv.conf"], timeout=5)
+                logger.info(
+                    "[%s] DNS не резолвит за 25с. resolv.conf:\n%s",
+                    ap_id, resolv.strip(),
+                )
+                status = "no_dns"
                 return self._make_result(ap_id, status, rtt_ms)
 
-            logger.debug("[%s] IP получен, проверяем интернет...", ap_id)
-
             # ----------------------------------------------------------
-            # Шаг 5: HTTP-проверка
+            # Шаг 6: HTTP-проверка
             # ----------------------------------------------------------
             t0 = time.monotonic()
             try:
@@ -308,7 +428,7 @@ class APChecker:
             # ----------------------------------------------------------
             # Cleanup — выполняется всегда
             # ----------------------------------------------------------
-            self._cleanup(conf_path)
+            self._cleanup(conf_path, action_path, pid_path, wpa_cli_proc)
 
         return self._make_result(ap_id, status, rtt_ms)
 
@@ -330,31 +450,51 @@ class APChecker:
             "lon":       pos["lon"] if pos else None,
         }
 
-    def _cleanup(self, conf_path):
+    def _cleanup(self, conf_path, action_path=None, pid_path=None, wpa_cli_proc=None):
         """
-        Останавливает wpa_supplicant, сбрасывает IP, удаляет conf.
-        Все ошибки логируются, но не пробрасываются.
+        Гасит wpa_cli -a, останавливает wpa_supplicant, сбрасывает IP,
+        удаляет временные файлы. Все ошибки логируются, не пробрасываются.
         """
-        # Останавливаем wpa_supplicant
-        rc, _, _ = _run(
-            ["wpa_cli", "-i", self.iface, "terminate"], timeout=5
-        )
-        if rc != 0:
-            # Fallback: pkill если wpa_cli не сработал
-            _run(["pkill", "-f", "wpa_supplicant.*{}".format(self.iface)], timeout=5)
-
-        # Сбрасываем IP
-        _run(["ip", "addr", "flush", "dev", self.iface], timeout=5)
-        # Освобождаем аренду DHCP если dhclient его держит
-        _run(["dhclient", "-r", self.iface], timeout=5)
-
-        # Удаляем временный conf (содержит пароль)
-        if conf_path and os.path.exists(conf_path):
+        # Гасим фоновый wpa_cli -a
+        if wpa_cli_proc is not None:
             try:
-                os.unlink(conf_path)
-                logger.debug("Временный conf удалён: %s", conf_path)
-            except OSError as exc:
-                logger.error("Не удалось удалить conf %s: %s", conf_path, exc)
+                wpa_cli_proc.terminate()
+                wpa_cli_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    wpa_cli_proc.kill()
+                except Exception:
+                    pass
+
+        # Останавливаем wpa_supplicant по PID-файлу, если есть
+        killed = False
+        if pid_path and os.path.exists(pid_path):
+            try:
+                with open(pid_path) as fh:
+                    pid = int(fh.read().strip())
+                os.kill(pid, 15)
+                killed = True
+            except (OSError, ValueError) as exc:
+                logger.debug("Не удалось убить по PID-файлу: %s", exc)
+
+        if not killed:
+            rc, _, _ = _run(["wpa_cli", "-i", self.iface, "terminate"], timeout=5)
+            if rc != 0:
+                # Fallback: pkill если wpa_cli не сработал
+                _run(["pkill", "-f", "wpa_supplicant.*{}".format(self.iface)], timeout=5)
+
+        # Освобождаем аренду DHCP и сбрасываем IP
+        _run(["dhclient", "-r", self.iface], timeout=5)
+        _run(["ip", "addr", "flush", "dev", self.iface], timeout=5)
+
+        # Удаляем временные файлы (conf содержит пароль)
+        for p in (conf_path, action_path, pid_path):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                    logger.debug("Удалён временный файл: %s", p)
+                except OSError as exc:
+                    logger.error("Не удалось удалить %s: %s", p, exc)
 
     # ------------------------------------------------------------------
     # Обход всех точек
@@ -406,17 +546,17 @@ if __name__ == "__main__":
     USAGE = """
 Использование (необходим root):
 
-  python -m src.ap_checker <интерфейс> <ap_targets.yaml>
+  sudo python3 -m src.ap_checker <интерфейс> <ap_targets.yaml>
 
   Запускает проверку всех включённых точек из файла и выводит результаты.
   БД не используется (результаты только в stdout).
 
 Пример:
-  sudo python -m src.ap_checker wlan1 config/ap_targets.yaml
+  sudo python3 -m src.ap_checker wlan0 config/ap_targets.yaml
 
 Требования:
   - <интерфейс> должен быть в managed mode (не monitor)
-  - wpa_supplicant, dhclient, iw должны быть установлены
+  - wpa_supplicant, wpa_cli, dhclient, iw должны быть установлены
   - ap_targets.yaml должен иметь права 600
 """.strip()
 
@@ -432,21 +572,31 @@ if __name__ == "__main__":
     iface         = sys.argv[1]
     targets_path  = sys.argv[2]
 
-    # Запуск без реальной БД и GPS — только вывод в stdout
-    class _NullConn:
-        def commit(self): pass
+    # Используем реальную БД в памяти — insert_ap_health работает без изменений
+    import sqlite3 as _sqlite3
+
+    _conn = _sqlite3.connect(":memory:")
+    _conn.executescript("""
+        CREATE TABLE ap_health (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ap_id     TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            status    TEXT NOT NULL,
+            rtt_ms    REAL,
+            lat       REAL,
+            lon       REAL,
+            has_gps   INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    _conn.commit()
 
     class _NullGPS:
         def latest(self): return None
 
-    # Мокаем insert_ap_health чтобы не нужна реальная БД
-    import src.ap_checker as _self_mod
-    _self_mod.insert_ap_health = lambda conn, data: None
-
     checker = APChecker(
         iface=iface,
         targets_path=targets_path,
-        conn=_NullConn(),
+        conn=_conn,
         gps=_NullGPS(),
     )
     results = checker.run_all()

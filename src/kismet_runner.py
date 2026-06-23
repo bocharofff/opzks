@@ -98,7 +98,7 @@ def _coords_valid(lat, lon):
 # Публичный API
 # ---------------------------------------------------------------------------
 
-def find_kismet_db(log_dir="data/", title="wardrive"):
+def find_kismet_db(log_dir="data/", title="scan_wifi"):
     """
     Находит самый свежий .kismet файл в log_dir с заданным title.
     Kismet создаёт базы по схеме: <log_dir><title>-YYYYMMDD-HH-MM-SS-N.kismet
@@ -112,33 +112,42 @@ def find_kismet_db(log_dir="data/", title="wardrive"):
     return max(matches, key=os.path.getmtime)
 
 
-def start_kismet(monitor_iface, log_dir="data/", title="wardrive"):
+def start_kismet(monitor_iface, log_dir="data/", title="scan_wifi",
+                 channels=None):
     """
-    Запускает Kismet как фоновый процесс в wardrive-режиме.
+    Запускает Kismet как фоновый процесс.
 
     Kismet сам генерирует имя базы: <log_dir><title>-YYYYMMDD-HH-MM-SS-1.kismet
     После старта находит созданный файл через find_kismet_db().
+
+    channels — список каналов для сканирования, например [1, 6, 11, 36, 44, 149].
+    Если None — Kismet делает hopping по всем каналам (может пропускать сети
+    на 5 ГГц из-за большого числа каналов и короткого времени на каждом).
+    Один канал (например channels=[44]) — фиксирует адаптер на нём.
 
     Возвращает кортеж (proc, kismet_db_path).
     Бросает RuntimeError если Kismet упал или база не создалась.
     """
     os.makedirs(log_dir, exist_ok=True)
 
-    # --daemonize НЕ используем: launcher завершится с кодом 0 и мы потеряем proc.
-    # --override wardrive включает kismetdb-логирование и отключает pcap.
-    # --log-types НЕ используем: в разных версиях Kismet этот флаг ведёт себя
-    #   непредсказуемо и может конфликтовать с --override wardrive.
-    # --log-prefix передаём как абсолютный путь, чтобы Kismet не искал файл
-    #   относительно своего рабочего каталога.
     abs_log_dir = os.path.abspath(log_dir)
     if not abs_log_dir.endswith(os.sep):
         abs_log_dir += os.sep
 
+    # Формируем строку источника: wlan0 или "wlan0:channels=1,6,11,44"
+    if channels:
+        ch_str = ",".join(str(c) for c in channels)
+        source = "{}:channels={}".format(monitor_iface, ch_str)
+        logger.info("Kismet: список каналов: %s", ch_str)
+    else:
+        source = monitor_iface
+        logger.info("Kismet: автоматический hopping по всем каналам")
+
     cmd = [
         "kismet",
-        "-c", monitor_iface,
+        "-c", source,
         "--no-ncurses",
-        "--override", "wardrive",
+        # "--override", "wardrive",
         "--log-prefix", abs_log_dir,
         "--log-title", title,
     ]
@@ -435,23 +444,66 @@ if __name__ == "__main__":
     monitor_iface = sys.argv[1]
     # Если папка не задана — по умолчанию data/
     log_dir = sys.argv[2] if len(sys.argv) > 2 else "data/"
+    # Если каналы не заданы — автоматический hopping
+    # Пример: sudo python3 -m src.kismet_runner wlan0 data/ 1,6,11,36,44,149
+    channels = None
+    if len(sys.argv) > 3:
+        channels = [int(c.strip()) for c in sys.argv[3].split(",")]
+        logger.info("Каналы для сканирования: %s", channels)
+
     kismet_db_path = None
     proc = None
 
     try:
         # 1. Запуск Kismet
         logger.info("=== ШАГ 1: Запуск Kismet на интерфейсе %s ===", monitor_iface)
-        # start_kismet возвращает (proc, db_path) — Kismet сам генерирует имя файла
-        proc, kismet_db_path = start_kismet(monitor_iface=monitor_iface, log_dir=log_dir)
+        proc, kismet_db_path = start_kismet(
+            monitor_iface=monitor_iface,
+            log_dir=log_dir,
+            channels=channels,
+        )
 
         # 2. Сбор данных
-        scan_duration = 15
-        logger.info("=== ШАГ 2: Ждем %d секунд, пока Kismet собирает сети... ===", scan_duration)
-        for i in range(scan_duration, 0, -1):
-            sys.stdout.write("\rОсталось времени сборки: {} сек... ".format(i))
+        # Ждём появления данных в базе — Kismet делает flush каждые 30 сек.
+        # Вместо слепого таймера: проверяем базу каждые 5 сек после первого flush.
+        # Минимум 35 сек (чтобы гарантированно прошёл первый flush),
+        # максимум 120 сек (защита от зависания).
+        min_wait   = 35
+        max_wait   = 120
+        check_interval = 5
+        elapsed = 0
+
+        logger.info("=== ШАГ 2: Сбор данных (мин. %d сек, макс. %d сек) ===",
+                    min_wait, max_wait)
+
+        last_count = 0
+        while elapsed < max_wait:
+            time.sleep(check_interval)
+            elapsed += check_interval
+            sys.stdout.write("\r  Прошло {} сек... ".format(elapsed))
             sys.stdout.flush()
-            time.sleep(1)
-        print("\n")
+
+            # Начинаем проверять базу только после min_wait
+            if elapsed < min_wait:
+                continue
+
+            # Читаем базу прямо сейчас (Kismet держит её открытой, но flush уже был)
+            try:
+                current = read_kismet_networks(kismet_db_path, since_ts=0.0)
+                count = len(current)
+            except Exception:
+                count = 0
+
+            if count > 0:
+                if count == last_count:
+                    # Данные есть и не прибавляются — можно останавливать
+                    logger.info("\n  Найдено %d сетей, данные стабильны — останавливаем", count)
+                    break
+                else:
+                    logger.info("\n  Найдено %d сетей, ждём ещё %d сек...", count, check_interval)
+                    last_count = count
+
+        print("")
 
     except KeyboardInterrupt:
         logger.info("\nТест прерван пользователем (Ctrl+C)")

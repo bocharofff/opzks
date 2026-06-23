@@ -1,19 +1,19 @@
-# Целевые точки доступа оператора для проверки работоспособности
-# ВНИМАНИЕ: файл содержит PSK — права доступа должны быть 600
-# chmod 600 config/ap_targets.yaml
-
 defaults:
   check_url: "http://connectivitycheck.gstatic.com/generate_204"
   check_timeout_s: 10
-  dhcp_timeout_s: 20
-
+  dhcp_timeout_s: 30
 access_points:
-  - id: "ap-garage-01"
-    ssid: "MyNet_Garage"
+  - id: "test-123"
+    ssid: "123"
+    bssid: "4E:F7:B9:66:A3:87"
     security: "wpa2-psk"
-    psk: "<PASSWORD>"
-    bssid: "AA:BB:CC:DD:EE:01"
-    expected_lat: 47.2225
-    expected_lon: 39.7188
+    psk: "11112222"
+    enabled: false
+
+  - id: "rwalse-rackoo-01"
+    ssid: "Rwalse Rackoo"
+    bssid: "FA:9E:E2:FF:CD:27"
+    security: "wpa2-psk"
+    psk: "WAes9711"
     enabled: true
-    notes: "гараж, северный въезд"
+    notes: "канал 6 (2.4GHz)"
