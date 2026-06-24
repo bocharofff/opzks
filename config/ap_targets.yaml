@@ -2,18 +2,26 @@ defaults:
   check_url: "http://connectivitycheck.gstatic.com/generate_204"
   check_timeout_s: 10
   dhcp_timeout_s: 30
+  
 access_points:
   - id: "test-123"
     ssid: "123"
     bssid: "4E:F7:B9:66:A3:87"
     security: "wpa2-psk"
     psk: "11112222"
-    enabled: false
+    enabled: true
 
   - id: "rwalse-rackoo-01"
     ssid: "Rwalse Rackoo"
-    bssid: "FA:9E:E2:FF:CD:27"
+    bssid: "D2:E9:D7:83:AC:74"
     security: "wpa2-psk"
     psk: "WAes9711"
     enabled: true
     notes: "канал 6 (2.4GHz)"
+
+  - id: "mt-free"
+    ssid: "MT_FREE"
+    bssid: "3A:31:74:46:66:4E"
+    security: "wpa2-psk"
+    psk: "qazwsxedcrfv"
+    enabled: true

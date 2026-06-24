@@ -159,16 +159,22 @@ class APChecker:
     # Генерация wpa_supplicant.conf
     # ------------------------------------------------------------------
 
-    def _write_wpa_conf(self, ap):
+    def _write_wpa_conf(self, ap, use_bssid=True):
         """
         Создаёт временный wpa_supplicant.conf для точки ap.
         Формат идентичен рабочему test_wpa2.conf.
         Устанавливает права 600. Возвращает путь к файлу.
         Содержимое файла (и пароли) НИКОГДА не логируются.
+
+        use_bssid=True  — привязка к bssid из конфига (точнее, не уведёт
+                          на чужую точку с тем же именем).
+        use_bssid=False — без bssid, цепляемся к любой точке с этим SSID.
+                          Нужно когда у точки рандомизированный/плавающий
+                          MAC (как у iPhone в режиме hotspot).
         """
         security = (ap.get("security") or "open").lower()
         ssid    = ap.get("ssid", "")
-        bssid   = ap.get("bssid")
+        bssid   = ap.get("bssid") if use_bssid else None
         hidden  = ap.get("hidden", False)
 
         # psk_hash имеет приоритет над psk (уже хешированный, без кавычек)
@@ -255,14 +261,51 @@ class APChecker:
 
     def check_one(self, ap):
         """
-        Полный цикл проверки одной точки через wpa_cli -a action-скрипт.
+        Проверка одной точки с фоллбэком по BSSID.
 
-        wpa_supplicant запускается с PID-файлом, wpa_cli с action-скриптом
-        реагирует на CONNECTED и сам запускает dhclient. Мы поллим появление
-        IP-адреса как признак ассоциации + DHCP, затем готовность DNS.
+        Сначала пробует подключиться с привязкой к bssid из конфига.
+        Если ассоциация не удалась (no_assoc) И в конфиге задан bssid —
+        повторяет попытку без bssid (по одному имени SSID). Это покрывает
+        случай плавающего/рандомизированного MAC точки (iPhone hotspot,
+        приватные MAC). На остальных статусах (no_dhcp/no_dns/no_inet/
+        captive_portal/ok) ретрай не нужен: ассоциация уже состоялась.
 
         Возвращает dict: {ap_id, status, rtt_ms, lat, lon, timestamp}.
         psk/psk_hash НИКОГДА не включаются в результат.
+        """
+        ap_id = ap.get("id", "unknown")
+        has_bssid = bool(ap.get("bssid"))
+
+        # Попытка 1: с BSSID (если он есть)
+        status, rtt_ms = self._try_connect(ap, use_bssid=True)
+
+        # Фоллбэк: только если не ассоциировались и BSSID был задан
+        if status == "no_assoc" and has_bssid:
+            logger.info(
+                "[%s] Не ассоциировались с BSSID %s — пробуем по имени SSID",
+                ap_id, ap.get("bssid"),
+            )
+            status, rtt_ms = self._try_connect(ap, use_bssid=False)
+            if status != "no_assoc":
+                logger.info(
+                    "[%s] Подключение по имени SSID удалось (BSSID сменился)",
+                    ap_id,
+                )
+
+        return self._make_result(ap_id, status, rtt_ms)
+
+    def _try_connect(self, ap, use_bssid=True):
+        """
+        Одна попытка подключения и проверки через wpa_cli -a action-скрипт.
+
+        wpa_supplicant запускается с PID-файлом, wpa_cli с action-скриптом
+        реагирует на CONNECTED и сам запускает dhclient. Поллим появление
+        IP-адреса как признак ассоциации + DHCP, затем готовность DNS.
+
+        use_bssid управляет привязкой к bssid (см. _write_wpa_conf).
+
+        Возвращает кортеж (status, rtt_ms). Результат-dict формирует
+        вызывающий check_one. psk/psk_hash НИКОГДА не логируются.
         """
         ap_id           = ap.get("id", "unknown")
         dhcp_timeout_s  = int(ap.get("dhcp_timeout_s",  self._defaults["dhcp_timeout_s"]))
@@ -280,7 +323,7 @@ class APChecker:
             # ----------------------------------------------------------
             # Шаг 1: создаём wpa_supplicant.conf и action-скрипт
             # ----------------------------------------------------------
-            conf_path = self._write_wpa_conf(ap)
+            conf_path = self._write_wpa_conf(ap, use_bssid=use_bssid)
             action_path = self._write_action_script()
             pid_path = conf_path + ".pid"
 
@@ -319,7 +362,7 @@ class APChecker:
                     ap_id, rc, stdout.strip(), stderr.strip(),
                 )
                 status = "no_assoc"
-                return self._make_result(ap_id, status, rtt_ms)
+                return status, rtt_ms
 
             # ----------------------------------------------------------
             # Шаг 3: запускаем wpa_cli -a в фоне (Popen, не _run).
@@ -334,7 +377,7 @@ class APChecker:
             except Exception as exc:
                 logger.warning("[%s] не удалось запустить wpa_cli -a: %s", ap_id, exc)
                 status = "error"
-                return self._make_result(ap_id, status, rtt_ms)
+                return status, rtt_ms
 
             # ----------------------------------------------------------
             # Шаг 4: ждём появления IP (action-скрипт уже сделал dhclient)
@@ -357,7 +400,7 @@ class APChecker:
                 else:
                     logger.info("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
                     status = "no_assoc"
-                return self._make_result(ap_id, status, rtt_ms)
+                return status, rtt_ms
 
             # ----------------------------------------------------------
             # Шаг 5: ждём готовности DNS — реальной попыткой резолва.
@@ -391,7 +434,7 @@ class APChecker:
                     ap_id, resolv.strip(),
                 )
                 status = "no_dns"
-                return self._make_result(ap_id, status, rtt_ms)
+                return status, rtt_ms
 
             # ----------------------------------------------------------
             # Шаг 6: HTTP-проверка
@@ -430,7 +473,7 @@ class APChecker:
             # ----------------------------------------------------------
             self._cleanup(conf_path, action_path, pid_path, wpa_cli_proc)
 
-        return self._make_result(ap_id, status, rtt_ms)
+        return status, rtt_ms
 
     def _make_result(self, ap_id, status, rtt_ms):
         """Формирует dict результата. Пароли никогда не включаются."""
