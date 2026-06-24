@@ -69,9 +69,11 @@ def set_monitor_mode(iface):
     rc, stdout, stderr = _run(["airmon-ng", "start", iface], timeout=15)
     if rc == 0:
         # Парсим строку вида "monitor mode vif enabled for [...] on <new_iface>"
-        match = re.search(r"monitor mode vif enabled.*?on\s+(\S+)", stdout)
+        
+        match = re.search(r"monitor mode vif enabled.*?on\s+(?:\[.*?\])?([a-zA-Z0-9_.-]+)", stdout)
+
         if match:
-            mon_iface = match.group(1).rstrip(")")
+            mon_iface = match.group(1)
             logger.info("airmon-ng: monitor mode включён, новый интерфейс: %s", mon_iface)
             return mon_iface
 

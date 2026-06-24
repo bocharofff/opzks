@@ -8,6 +8,8 @@ ENV/
 data/*.log
 data/*.kismet
 data/*.wiglecsv
+data/*.db
+
 
 export/*.csv
 
