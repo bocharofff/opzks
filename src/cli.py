@@ -257,14 +257,18 @@ def _prompt_mode(args):
     print("  1 — Мониторинг (Kismet + GPS), 1 карта (monitor)")
     print("  2 — Проверка точек оператора, 1 карта (managed)")
     print("  3 — Мониторинг + проверка, 2 карты (monitor + managed)")
+    print("  0 — Выход из программы")  # Добавили пункт выхода
     while True:
         try:
-            choice = input("Выберите режим [1/2/3]: ").strip()
+            choice = input("Выберите режим [1/2/3/0]: ").strip()
         except (EOFError, KeyboardInterrupt):
-            return None
+            return 0  # При Ctrl+C в меню сразу возвращаем 0 на выход
+        
         if choice in ("1", "2", "3"):
             return int(choice)
-        print("Введите 1, 2 или 3.")
+        if choice == "0":
+            return 0  # Возвращаем 0 для корректного выхода из цикла main
+        print("Введите 1, 2, 3 или 0.")
 
 
 # ===========================================================================
@@ -323,7 +327,7 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
         mon_iface = ifmgr.set_monitor_mode(orig_iface)  # может бросить RuntimeError
         logger.info("Monitor-интерфейс: %s", mon_iface)
 
-        logger.info("Запускаем Kismet (каналы: %s) ...", channels or "авто-hopping")
+        logger.info("Запускаем Kismet (каналы: %s) ...", channels or "")
         proc, kismet_db = kismet_runner.start_kismet(
             mon_iface, log_dir=log_dir, title=title, channels=channels
         )
@@ -335,7 +339,9 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
         while not stop_event.is_set():
             _sleep_responsive(stop_event, sync_interval)
             if stop_event.is_set():
+                logger.info("\nСбор данных прерван оператором. Идет остановка процессов...")
                 break
+
             now = time.time()
             try:
                 count = kismet_runner.sync_kismet_to_db(kismet_db, conn, gps, since_ts=last_sync)
@@ -433,8 +439,52 @@ def ap_check_loop(checker, conn, stop_event, single_pass, duration, pause):
 # Диспетчеры режимов
 # ===========================================================================
 
+def _print_scan_results(db_path: str) -> None:
+    """Читает финальные данные из проектной СУБД и выводит красивую таблицу."""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        
+        # Выбираем агрегированные данные по сетям и их последним наблюдениям
+        rows = conn.execute("""
+            SELECT n.bssid, n.ssid, n.encryption, n.channel, 
+                   o.lat, o.lon, max(o.timestamp) as last_seen
+            FROM networks n
+            LEFT JOIN observations o ON n.bssid = o.bssid
+            GROUP BY n.bssid
+            ORDER BY last_seen DESC
+        """).fetchall()
+        
+        conn.close()
+        
+        if not rows:
+            logger.warning("После остановки мониторинга в базе данных не обнаружено записей.")
+            return
+
+        print("\n" + "=" * 94)
+        print(" РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ (Всего обнаружено уникальных сетей: {})".format(len(rows)))
+        print("=" * 94)
+        print("{:<20} {:<32} {:<10} {:<8} {:<11} {:<11}".format(
+            "BSSID", "SSID", "Шифр.", "Канал", "Широта", "Долгота"
+        ))
+        print("-" * 94)
+        for r in rows:
+            print("{:<20} {:<32} {:<10} {:<8} {:<11} {:<11}".format(
+                r["bssid"] or "",
+                (r["ssid"] or "")[:31],
+                (r["encryption"] or "")[:9],
+                str(r["channel"] or ""),
+                str(round(r["lat"], 5)) if r["lat"] else "No GPS",
+                str(round(r["lon"], 5)) if r["lon"] else "No GPS",
+            ))
+        print("=" * 94 + "\n")
+        
+    except Exception as exc:
+        logger.error("Не удалось отобразить результаты сканирования: %s", exc)
+
+
 def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
-    """Режим 1 — только мониторинг (одна карта в monitor mode)."""
+    """Режим 1 — только мониторинг (одна карта в monitor mode) с выводом результатов."""
     conn = _open_db(config["db_path"])
     try:
         monitor_collect(
@@ -443,7 +493,12 @@ def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
             stop_event, duration if duration > 0 else None,
         )
     finally:
+        # 2. Закрываем соединение с базой (вызовется и при Ctrl+C, и при штатном выходе)
         conn.close()
+
+    # 3. Теперь отчет выведется железно в любом сценарии
+    logger.info("Формирование отчета по собранным данным...")
+    _print_scan_results(config["db_path"])
 
 
 def run_mode_2(config, client_ad, gps, stop_event, duration, pause):
@@ -627,8 +682,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="вывести список Wi-Fi адаптеров и выйти")
     parser.add_argument("--no-gps", action="store_true", dest="no_gps",
                         help="не использовать GPS (записи без координат)")
-    parser.add_argument("--remember", action="store_true",
-                        help="запомнить выбор карт (data/roles.json)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="неинтерактивный режим (не задавать вопросов)")
     parser.add_argument("--export", nargs="+", choices=EXPORT_PROFILES, metavar="ПРОФИЛЬ",
@@ -655,7 +708,6 @@ def main(argv=None) -> int:
 
     adapters = adapters_mod.list_wifi_adapters()
 
-    # --list: только перечисление (критерий приёмки раздела 17)
     if args.list:
         print(adapters_mod.format_adapters_table(adapters))
         return 0
@@ -664,81 +716,80 @@ def main(argv=None) -> int:
         logger.error("Wi-Fi адаптеры не найдены. Проверьте проброс USB-устройств в ВМ.")
         return 1
 
-    # Режим
-    mode = args.mode
-    if mode is None:
-        mode = _prompt_mode(args)
-        if mode is None:
-            return 2
-
-    # Назначение карт ролям
-    try:
-        monitor_ad, client_ad = select_adapters(mode, args, adapters)
-    except RuntimeError as exc:
-        logger.error("%s", exc)
-        return 2
-
-    # Лог выбранных ролей по стабильному идентификатору
-    if monitor_ad:
-        logger.info("Роль МОНИТОР: %s (MAC %s, USB %s, чипсет %s)",
-                    monitor_ad["iface"], monitor_ad["mac"],
-                    monitor_ad.get("usb_path"), monitor_ad.get("chipset"))
-        # Раздел 7 ТЗ: при несоответствии — предупреждение, без аварийного завершения
-        if not monitor_ad.get("supports_monitor"):
-            logger.warning(
-                "Карта %s не заявляет поддержку monitor mode — "
-                "Kismet может не запуститься", monitor_ad["iface"]
-            )
-            if _is_interactive() and not args.yes and not _confirm("Продолжить всё равно?"):
-                logger.info("Отменено пользователем")
-                return 0
-    if client_ad:
-        logger.info("Роль КЛИЕНТ: %s (MAC %s, USB %s)",
-                    client_ad["iface"], client_ad["mac"], client_ad.get("usb_path"))
-
-    # Запоминание выбора
-    if args.remember:
-        roles = {}
-        if monitor_ad:
-            roles["monitor"] = monitor_ad["mac"]
-        if client_ad:
-            roles["client"] = client_ad["mac"]
-        save_role_cache(roles)
-
-    # GPS (для всех режимов: координаты нужны и наблюдениям, и ap_health)
+    # GPS инициализируется один раз на всё время работы программы
     gps = setup_gps(config, use_gps=not args.no_gps)
 
-    # Обработка сигналов: корректная остановка по Ctrl+C / SIGTERM
-    stop_event = threading.Event()
+    channels = _parse_channels(args.channels)
 
+    try:
+        # Интерактивный цикл: крутится, пока пользователь сам не выйдет из меню
+        while True:
+            # Сбрасываем флаг остановки перед запуском нового режима
+            mode = args.mode
+            if mode is None:
+                try:
+                    mode = _prompt_mode(args)
+                except (KeyboardInterrupt, EOFError):
+                    print("") # Снос строки после ^C в меню
+                    break # Выход из программы, если нажали Ctrl+C прямо в меню
+                if mode is None:
+                    break
+            
+            try:
+                monitor_ad, client_ad = select_adapters(mode, args, adapters)
+            except RuntimeError as exc:
+                logger.error("%s", exc)
+                return 2
+                
+            # Лог выбранных ролей по стабильному идентификатору
+            if monitor_ad:
+                logger.info("Роль МОНИТОР: %s (MAC %s, USB %s, чипсет %s)",
+                            monitor_ad["iface"], monitor_ad["mac"],
+                            monitor_ad.get("usb_path"), monitor_ad.get("chipset"))
+                if not monitor_ad.get("supports_monitor"):
+                    logger.warning(
+                        "Карта %s не заявляет поддержку monitor mode — "
+                        "Kismet может не запуститься", monitor_ad["iface"]
+                    )
+                    if _is_interactive() and not args.yes and not _confirm("Продолжить всё равно?"):
+                        logger.info("Отменено пользователем")
+                        return 0
+            if client_ad:
+                logger.info("Роль КЛИЕНТ: %s (MAC %s, USB %s)", client_ad["iface"], client_ad["mac"], client_ad.get("usb_path"))
+
+            run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, args.ap_pause, mode)
+            
+            # Если режим жестко задан аргументом командной строки (например, --mode 1) — выходим
+            if args.mode is not None:
+                break
+
+            print("\nВозврат в главное меню выбор режима...")
+            time.sleep(1)
+
+    finally:
+        if gps is not None:
+            gps.stop()
+
+    logger.info("Готово.")
+    return 0
+
+def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause,  mode):
+    # Событие stop_event теперь сбрасываемое, оно сигнализирует об остановке ТЕКУЩЕГО режима
+    stop_event = threading.Event()
     def _handle_signal(signum, _frame):
-        logger.info("Получен сигнал %s — завершаем работу ...", signum)
+        logger.info("Получен сигнал %s — прерываем текущий режим ...", signum)
         stop_event.set()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    channels = _parse_channels(args.channels)
-
-    try:
-        if mode == 1:
-            run_mode_1(config, monitor_ad, gps, stop_event, args.duration, channels)
-        elif mode == 2:
-            run_mode_2(config, client_ad, gps, stop_event, args.duration, args.ap_pause)
-        elif mode == 3:
-            run_mode_3(config, monitor_ad, client_ad, gps, stop_event,
-                       args.duration, channels, args.ap_pause)
-    finally:
-        if gps is not None:
-            gps.stop()
-
-    # Экспорт (если запрошен)
-    if args.export:
-        do_exports(config["db_path"], args.export, args.export_bssid)
-
-    logger.info("Готово.")
-    return 0
-
+    if mode == 1:
+        run_mode_1(config, monitor_ad, gps, stop_event, duration, channels)
+    elif mode == 2:
+        run_mode_2(config, client_ad, gps, stop_event, duration, ap_pause)
+    elif mode == 3:
+        run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels, ap_pause)
+            
 
 if __name__ == "__main__":
     sys.exit(main())
