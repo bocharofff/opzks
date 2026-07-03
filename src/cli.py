@@ -257,18 +257,15 @@ def _prompt_mode(args):
     print("  1 — Мониторинг (Kismet + GPS), 1 карта (monitor)")
     print("  2 — Проверка точек оператора, 1 карта (managed)")
     print("  3 — Мониторинг + проверка, 2 карты (monitor + managed)")
-    print("  0 — Выход из программы")  # Добавили пункт выхода
     while True:
         try:
-            choice = input("Выберите режим [1/2/3/0]: ").strip()
+            choice = input("Выберите режим [1/2/3] (Ctrl+C — выход): ").strip()
         except (EOFError, KeyboardInterrupt):
-            return 0  # При Ctrl+C в меню сразу возвращаем 0 на выход
-        
+            print("")  # перенос строки после ^C
+            return None  # отмена выбора → выход из программы
         if choice in ("1", "2", "3"):
             return int(choice)
-        if choice == "0":
-            return 0  # Возвращаем 0 для корректного выхода из цикла main
-        print("Введите 1, 2, 3 или 0.")
+        print("Введите 1, 2 или 3.")
 
 
 # ===========================================================================
@@ -722,49 +719,43 @@ def main(argv=None) -> int:
     channels = _parse_channels(args.channels)
 
     try:
-        # Интерактивный цикл: крутится, пока пользователь сам не выйдет из меню
-        while True:
-            # Сбрасываем флаг остановки перед запуском нового режима
-            mode = args.mode
+        # Режим выбирается ОДИН раз: из --mode либо интерактивно. После его
+        # завершения программа выходит — возврата в меню нет.
+        mode = args.mode
+        if mode is None:
+            mode = _prompt_mode(args)
             if mode is None:
-                try:
-                    mode = _prompt_mode(args)
-                except (KeyboardInterrupt, EOFError):
-                    print("") # Снос строки после ^C в меню
-                    break # Выход из программы, если нажали Ctrl+C прямо в меню
-                if mode is None:
-                    break
-            
-            try:
-                monitor_ad, client_ad = select_adapters(mode, args, adapters)
-            except RuntimeError as exc:
-                logger.error("%s", exc)
-                return 2
-                
-            # Лог выбранных ролей по стабильному идентификатору
-            if monitor_ad:
-                logger.info("Роль МОНИТОР: %s (MAC %s, USB %s, чипсет %s)",
-                            monitor_ad["iface"], monitor_ad["mac"],
-                            monitor_ad.get("usb_path"), monitor_ad.get("chipset"))
-                if not monitor_ad.get("supports_monitor"):
-                    logger.warning(
-                        "Карта %s не заявляет поддержку monitor mode — "
-                        "Kismet может не запуститься", monitor_ad["iface"]
-                    )
-                    if _is_interactive() and not args.yes and not _confirm("Продолжить всё равно?"):
-                        logger.info("Отменено пользователем")
-                        return 0
-            if client_ad:
-                logger.info("Роль КЛИЕНТ: %s (MAC %s, USB %s)", client_ad["iface"], client_ad["mac"], client_ad.get("usb_path"))
+                logger.info("Режим не выбран — выход.")
+                return 0
 
-            run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, args.ap_pause, mode)
-            
-            # Если режим жестко задан аргументом командной строки (например, --mode 1) — выходим
-            if args.mode is not None:
-                break
+        try:
+            monitor_ad, client_ad = select_adapters(mode, args, adapters)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 2
 
-            print("\nВозврат в главное меню выбор режима...")
-            time.sleep(1)
+        # Лог выбранных ролей по стабильному идентификатору
+        if monitor_ad:
+            logger.info("Роль МОНИТОР: %s (MAC %s, USB %s, чипсет %s)",
+                        monitor_ad["iface"], monitor_ad["mac"],
+                        monitor_ad.get("usb_path"), monitor_ad.get("chipset"))
+            if not monitor_ad.get("supports_monitor"):
+                logger.warning(
+                    "Карта %s не заявляет поддержку monitor mode — "
+                    "Kismet может не запуститься", monitor_ad["iface"]
+                )
+                if _is_interactive() and not args.yes and not _confirm("Продолжить всё равно?"):
+                    logger.info("Отменено пользователем")
+                    return 0
+        if client_ad:
+            logger.info("Роль КЛИЕНТ: %s (MAC %s, USB %s)",
+                        client_ad["iface"], client_ad["mac"], client_ad.get("usb_path"))
+
+        run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, args.ap_pause, mode)
+
+        # Экспорт профилей после отработки режима (раздел 13 ТЗ, --export)
+        if args.export:
+            do_exports(config["db_path"], args.export, args.export_bssid)
 
     finally:
         if gps is not None:
@@ -773,11 +764,13 @@ def main(argv=None) -> int:
     logger.info("Готово.")
     return 0
 
-def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause,  mode):
-    # Событие stop_event теперь сбрасываемое, оно сигнализирует об остановке ТЕКУЩЕГО режима
+
+def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause, mode):
+    """Настраивает обработчики сигналов и запускает выбранный режим один раз."""
     stop_event = threading.Event()
+
     def _handle_signal(signum, _frame):
-        logger.info("Получен сигнал %s — прерываем текущий режим ...", signum)
+        logger.info("Получен сигнал %s — останавливаем работу ...", signum)
         stop_event.set()
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -789,7 +782,7 @@ def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause,  
         run_mode_2(config, client_ad, gps, stop_event, duration, ap_pause)
     elif mode == 3:
         run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels, ap_pause)
-            
+
 
 if __name__ == "__main__":
     sys.exit(main())
