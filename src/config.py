@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from rich.logging import RichHandler
+
+from src.ui import console as _console
 
 # ---------------------------------------------------------------------------
 # Встроенные значения по умолчанию (зеркалируют config/settings.yaml)
@@ -100,7 +103,9 @@ def setup_logging(config: dict) -> None:
     Создаёт два handler'а с РАЗНЫМИ уровнями (root всегда ``DEBUG``, чтобы оба
     handler'а получали все записи, а фильтрация — на уровне handler'а):
 
-    * ``StreamHandler`` (консоль) — уровень зависит от режима:
+    * ``RichHandler`` (консоль, использует общий ``src.ui.console`` — тот же
+      Console, которым таблицы/спиннеры пользуются в cli.py, чтобы вывод не
+      «дрался» за stdout) — уровень зависит от режима:
         - обычный режим (``config['debug']`` не задан/``False``) — уровень из
           ``config['log_level']`` (по умолчанию ``INFO``): только майлстоуны,
           итоги проверки точек, warnings и errors;
@@ -108,8 +113,8 @@ def setup_logging(config: dict) -> None:
           — уровень ``DEBUG``: полная детальность (пер-цикловые синхронизации,
           промежуточные шаги проверки точек и т.д.).
     * ``FileHandler`` (``config['log_file']``) — ВСЕГДА ``DEBUG``, независимо от
-      режима консоли: полный журнал доступен для разбора инцидентов постфактум
-      без перезапуска в debug-режиме.
+      режима консоли, обычным (не-rich) форматтером: полный журнал доступен для
+      разбора инцидентов постфактум без перезапуска в debug-режиме.
 
     Дополнительно приглушает известные болтливые сторонние логгеры (см.
     :data:`_NOISY_THIRD_PARTY`) до ``WARNING`` — иначе их DEBUG заливает и
@@ -136,14 +141,20 @@ def setup_logging(config: dict) -> None:
     # Создаём директорию для лог-файла если не существует
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # RichHandler сам рисует время/уровень своей колонкой — форматтеру оставляем
+    # только имя логгера и сообщение, иначе они задвоятся.
+    console_handler = RichHandler(
+        console=_console,
+        show_path=False,
+        rich_tracebacks=True,
+        log_time_format="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    console_handler.setLevel(console_level)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-    stream_handler.setLevel(console_level)
-
+    file_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(fmt)
+    file_handler.setFormatter(file_fmt)
     file_handler.setLevel(logging.DEBUG)
 
     root = logging.getLogger()
@@ -154,7 +165,7 @@ def setup_logging(config: dict) -> None:
     # root — DEBUG, чтобы ничего не отсекалось до handler'ов; реальная
     # фильтрация консоли/файла — через уровни самих handler'ов выше.
     root.setLevel(logging.DEBUG)
-    root.addHandler(stream_handler)
+    root.addHandler(console_handler)
     root.addHandler(file_handler)
 
     for name in _NOISY_THIRD_PARTY:

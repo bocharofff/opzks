@@ -10,12 +10,13 @@ tests/test_logging.py — режимы логирования (обычный / 
 
 import logging
 
+from rich.logging import RichHandler
+
 from src.config import setup_logging, _DEFAULTS
 
 
 def _handlers_by_type(root):
-    stream = [h for h in root.handlers if isinstance(h, logging.StreamHandler)
-              and not isinstance(h, logging.FileHandler)]
+    stream = [h for h in root.handlers if isinstance(h, RichHandler)]
     file_ = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
     return stream, file_
 
@@ -76,7 +77,7 @@ def test_repeated_calls_do_not_duplicate_handlers(tmp_path):
     setup_logging({"log_level": "INFO", "log_file": log_file, "debug": True})
 
     root = logging.getLogger()
-    assert len(root.handlers) == 2      # ровно один StreamHandler + один FileHandler
+    assert len(root.handlers) == 2      # ровно один RichHandler + один FileHandler
 
 
 def test_noisy_third_party_loggers_muted_to_warning(tmp_path):

@@ -28,6 +28,7 @@ src/cli.py — оркестрация всего проекта wifi-monitor.
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -44,6 +45,7 @@ from src import interface_manager as ifmgr
 from src.gps_monitor import GPSMonitor
 from src import kismet_runner
 from src import scanner
+from src import ui
 from src.ap_checker import APChecker
 from src.db import init_db, insert_ap_health, checkpoint, select_recent_networks
 from src import exporter
@@ -56,8 +58,8 @@ ROLE_CACHE_PATH = "data/roles.json"
 EXPORT_DIR = "export"
 # Префикс журналов Kismet (совпадает с дефолтом kismet_runner)
 KISMET_TITLE = "scan_wifi"
-# Доступные профили экспорта (раздел 13 ТЗ)
-EXPORT_PROFILES = ("heatmap", "full", "wigle", "ap_status")
+# Доступные профили экспорта (раздел 13 ТЗ) — источник истины в src.exporter
+EXPORT_PROFILES = exporter.EXPORT_PROFILES
 
 
 # ===========================================================================
@@ -173,8 +175,8 @@ def _interactive_pick(adapters, role_desc, require_monitor, args, exclude=None):
             "(укажите --monitor / --client по MAC, имени или USB-пути)".format(role_desc)
         )
 
-    print("\nВыбор карты для роли: {}".format(role_desc))
-    print(adapters_mod.format_adapters_table(adapters))
+    ui.console.print("\n[bold]Выбор карты для роли:[/bold] {}".format(role_desc))
+    ui.console.print(ui.adapters_table(adapters))
 
     while True:
         try:
@@ -183,16 +185,16 @@ def _interactive_pick(adapters, role_desc, require_monitor, args, exclude=None):
             raise RuntimeError("Ввод прерван")
 
         if not choice.isdigit():
-            print("Введите номер.")
+            ui.console.print("[red]Введите номер.[/red]")
             continue
         idx = int(choice)
         if not (1 <= idx <= len(adapters)):
-            print("Номер вне диапазона.")
+            ui.console.print("[red]Номер вне диапазона.[/red]")
             continue
 
         adapter = adapters[idx - 1]
         if exclude is not None and adapter["iface"] == exclude["iface"]:
-            print("Эта карта уже выбрана для другой роли — выберите другую.")
+            ui.console.print("[yellow]Эта карта уже выбрана для другой роли — выберите другую.[/yellow]")
             continue
         if require_monitor and not adapter.get("supports_monitor"):
             if not _confirm("Карта {} не заявляет monitor mode. Всё равно выбрать?".format(adapter["iface"])):
@@ -256,10 +258,10 @@ def _prompt_mode(args):
         logger.error("Режим не задан (--mode 1|2|3) и нет интерактивного терминала")
         return None
 
-    print("\nРежимы работы:")
-    print("  1 — Мониторинг (Kismet + GPS), 1 карта (monitor)")
-    print("  2 — Проверка точек оператора, 1 карта (managed)")
-    print("  3 — Мониторинг + проверка, 2 карты (monitor + managed)")
+    ui.console.print("\n[bold]Режимы работы:[/bold]")
+    ui.console.print("  [cyan]1[/cyan] — Мониторинг (Kismet + GPS), 1 карта (monitor)")
+    ui.console.print("  [cyan]2[/cyan] — Проверка точек оператора, 1 карта (managed)")
+    ui.console.print("  [cyan]3[/cyan] — Мониторинг + проверка, 2 карты (monitor + managed)")
     while True:
         try:
             choice = input("Выберите режим [1/2/3] (Ctrl+C — выход): ").strip()
@@ -268,7 +270,7 @@ def _prompt_mode(args):
             return None  # отмена выбора → выход из программы
         if choice in ("1", "2", "3"):
             return int(choice)
-        print("Введите 1, 2 или 3.")
+        ui.console.print("[red]Введите 1, 2 или 3.[/red]")
 
 
 # ===========================================================================
@@ -285,8 +287,10 @@ def setup_gps(config: dict, use_gps: bool):
     port = int(config.get("gps_port", 2947))
     gps = GPSMonitor(host=host, port=port)
 
-    logger.info("Проверяем наличие GPS-фикса (gpsd %s:%s) ...", host, port)
-    if gps.check_fix():
+    logger.debug("Проверяем наличие GPS-фикса (gpsd %s:%s) ...", host, port)
+    with ui.spinner("Проверяем GPS-фикс (gpsd {}:{}) ...".format(host, port)):
+        has_fix = gps.check_fix()
+    if has_fix:
         logger.info("GPS-фикс получен")
     else:
         logger.warning(
@@ -303,7 +307,8 @@ def setup_gps(config: dict, use_gps: bool):
 # ===========================================================================
 
 def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
-                    sync_interval, stop_event, duration, bucket_sec=1):
+                    sync_interval, stop_event, duration, bucket_sec=1,
+                    use_spinner=False):
     """Полный жизненный цикл пассивного сбора на одной карте.
 
     Шаги: монитор-карта → unmanaged (NetworkManager) → monitor mode →
@@ -312,8 +317,12 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
     восстановление интерфейса. Все ошибки логируются; интерфейс всегда
     восстанавливается в блоке finally.
 
-    duration:   число секунд или None (работать до stop_event).
-    bucket_sec: даунсэмплинг тепловой карты (1 сэмпл на N секунд на сеть).
+    duration:    число секунд или None (работать до stop_event).
+    bucket_sec:  даунсэмплинг тепловой карты (1 сэмпл на N секунд на сеть).
+    use_spinner: показывать спиннер на запуске Kismet — только для режима 1
+                 (единственный поток пишет в консоль); режим 3 запускает эту
+                 функцию в фоновом потоке параллельно с проверкой точек, где
+                 спиннер мешал бы — там всегда False.
     """
     orig_iface = monitor_iface
     mon_iface = None
@@ -328,10 +337,12 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
         mon_iface = ifmgr.set_monitor_mode(orig_iface)  # может бросить RuntimeError
         logger.info("Monitor-интерфейс: %s", mon_iface)
 
-        logger.info("Запускаем Kismet (каналы: %s) ...", channels or "")
-        proc, kismet_db = kismet_runner.start_kismet(
-            mon_iface, log_dir=log_dir, title=title, channels=channels
-        )
+        logger.debug("Запускаем Kismet (каналы: %s) ...", channels or "")
+        spin_ctx = ui.spinner("Запускаем Kismet ...") if use_spinner else contextlib.nullcontext()
+        with spin_ctx:
+            proc, kismet_db = kismet_runner.start_kismet(
+                mon_iface, log_dir=log_dir, title=title, channels=channels
+            )
         logger.info("Kismet работает, база: %s", kismet_db)
 
         last_packetid = 0  # водораздел по packetid (инкрементальное чтение packets)
@@ -473,7 +484,10 @@ def ap_check_loop(checker, conn, stop_event, presence_fn, targets,
                 logger.error("[%s] Ошибка записи в ap_health: %s", ap_id, exc)
             last_checked[ap_id] = time.monotonic()
             rtt = "{:.0f} мс".format(result["rtt_ms"]) if result.get("rtt_ms") else "—"
-            logger.info("[%s] Результат: %s, RTT: %s", ap_id, result["status"], rtt)
+            # В файл (всегда DEBUG) — текстовая строка; в консоль (всегда, обе
+            # степени детальности) — цветной пользовательский итог через ui.
+            logger.debug("[%s] Результат: %s, RTT: %s", ap_id, result["status"], rtt)
+            ui.ap_result(ap_id, result["status"], result.get("rtt_ms"), ssid=target.get("ssid"))
 
         if duration is not None and (time.monotonic() - start) >= duration:
             logger.info("Истекло время проверки точек (%d c)", duration)
@@ -490,41 +504,25 @@ def _print_scan_results(db_path: str) -> None:
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        
+
         # Выбираем агрегированные данные по сетям и их последним наблюдениям
         rows = conn.execute("""
-            SELECT n.bssid, n.ssid, n.encryption, n.channel, 
+            SELECT n.bssid, n.ssid, n.encryption, n.channel,
                    o.lat, o.lon, max(o.timestamp) as last_seen
             FROM networks n
             LEFT JOIN observations o ON n.bssid = o.bssid
             GROUP BY n.bssid
             ORDER BY last_seen DESC
         """).fetchall()
-        
+
         conn.close()
-        
+
         if not rows:
             logger.warning("После остановки мониторинга в базе данных не обнаружено записей.")
             return
 
-        print("\n" + "=" * 94)
-        print(" РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ (Всего обнаружено уникальных сетей: {})".format(len(rows)))
-        print("=" * 94)
-        print("{:<20} {:<32} {:<10} {:<8} {:<11} {:<11}".format(
-            "BSSID", "SSID", "Шифр.", "Канал", "Широта", "Долгота"
-        ))
-        print("-" * 94)
-        for r in rows:
-            print("{:<20} {:<32} {:<10} {:<8} {:<11} {:<11}".format(
-                r["bssid"] or "",
-                (r["ssid"] or "")[:31],
-                (r["encryption"] or "")[:9],
-                str(r["channel"] or ""),
-                str(round(r["lat"], 5)) if r["lat"] else "No GPS",
-                str(round(r["lon"], 5)) if r["lon"] else "No GPS",
-            ))
-        print("=" * 94 + "\n")
-        
+        ui.console.print(ui.scan_results_table(rows))
+
     except Exception as exc:
         logger.error("Не удалось отобразить результаты сканирования: %s", exc)
 
@@ -540,10 +538,13 @@ def make_scan_presence(iface):
     """Присутствие через активный скан клиентской карты (режим 2).
 
     Возвращает callable → ``{ssid: {bssid, signal, security}}`` по данным
-    ``iw dev <iface> scan`` (security выводится из beacon-а).
+    ``iw dev <iface> scan`` (security выводится из beacon-а). Единственный
+    поток в режиме 2 пишет в консоль, поэтому скан сопровождается спиннером.
     """
     def presence():
-        return scanner.strongest_by_ssid(scanner.scan_visible(iface))
+        with ui.spinner("Сканируем эфир ({}) ...".format(iface)):
+            networks = scanner.scan_visible(iface)
+        return scanner.strongest_by_ssid(networks)
     return presence
 
 
@@ -576,6 +577,7 @@ def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
             _log_dir(config), KISMET_TITLE, int(config["sync_interval_sec"]),
             stop_event, duration if duration > 0 else None,
             bucket_sec=int(config["heatmap_sample_sec"]),
+            use_spinner=True,
         )
     finally:
         # 2. Закрываем соединение с базой (вызовется и при Ctrl+C, и при штатном выходе)
@@ -696,8 +698,20 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
 # Экспорт (раздел 13 ТЗ)
 # ===========================================================================
 
-def do_exports(db_path, profiles, bssid_filter):
-    """Выгружает указанные профили в export/<профиль>_<timestamp>.csv."""
+def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
+    """Выгружает указанные профили экспорта (раздел 13 ТЗ) и печатает сводную таблицу.
+
+    ``full`` создаёт ОБА файла (.gpkg + .csv); ``heatmap_networks`` пишет
+    подкаталог с одним CSV на сеть + манифест — оба профиля не укладываются в
+    схему «один профиль → один файл», поэтому обрабатываются явно, а не через
+    единый handlers-словарь.
+
+    ``ssid_filter`` — обычный способ выбрать сеть для профиля ``heatmap``: MAC
+    знать не нужно. Если под этим именем наблюдалось несколько РАЗНЫХ точек
+    (коллизия — частое дело для дефолтных SSID вроде «Keenetic-1234»), экспорт
+    этого профиля прерывается с понятной ошибкой и списком MAC-кандидатов —
+    тогда уточнить нужно уже через ``--export-bssid``.
+    """
     if not os.path.exists(db_path):
         logger.error("База не найдена для экспорта: %s", db_path)
         return
@@ -705,29 +719,82 @@ def do_exports(db_path, profiles, bssid_filter):
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     os.makedirs(EXPORT_DIR, exist_ok=True)
 
-    handlers = {
-        "heatmap":   lambda c, out: exporter.export_heatmap_csv(c, out, bssid_filter=bssid_filter),
-        "full":      exporter.export_full_dataset_csv,
-        "wigle":     exporter.export_wigle_csv,
-        "ap_status": exporter.export_ap_status_csv,
-    }
-
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+
+    # --export-ssid: разрешаем имя в BSSID один раз, до цикла по профилям —
+    # если имя не найдено или коллизирует с несколькими MAC, heatmap пропускаем
+    # с понятным сообщением, остальные профили (wigle/full/...) не затрагиваем.
+    if ssid_filter and not bssid_filter:
+        resolved, candidates = exporter.resolve_bssid_by_ssid(conn, ssid_filter)
+        if resolved is None:
+            if not candidates:
+                logger.error("Экспорт «heatmap»: сеть с именем %r не найдена", ssid_filter)
+            else:
+                logger.error(
+                    "Экспорт «heatmap»: имя %r совпадает с %d разными точками "
+                    "(разные MAC) — уточните через --export-bssid: %s",
+                    ssid_filter, len(candidates), ", ".join(candidates),
+                )
+            profiles = [p for p in profiles if p != "heatmap"]
+        else:
+            bssid_filter = resolved
+
+    summary = []  # (профиль, результат, путь) — для итоговой таблицы
     try:
         for profile in profiles:
-            handler = handlers.get(profile)
-            if handler is None:
-                logger.warning("Неизвестный профиль экспорта: %s", profile)
-                continue
-            out_path = os.path.join(EXPORT_DIR, "{}_{}.csv".format(profile, ts))
             try:
-                count = handler(conn, out_path)
-                logger.info("Экспорт «%s»: %s строк → %s", profile, count, out_path)
+                if profile == "full":
+                    out_base = os.path.join(EXPORT_DIR, "full_{}".format(ts))
+                    result = exporter.export_full_dataset(conn, out_base)
+                    logger.info(
+                        "Экспорт «full»: %d точек (.gpkg), %d строк (.csv) → %s.*",
+                        result["gpkg"], result["csv"], out_base,
+                    )
+                    summary.append(("full", "{} точек".format(result["gpkg"]), out_base + ".gpkg"))
+                    summary.append(("full", "{} строк".format(result["csv"]), out_base + ".csv"))
+
+                elif profile == "heatmap_networks":
+                    out_dir = os.path.join(EXPORT_DIR, "heatmap_networks_{}".format(ts))
+                    result = exporter.export_heatmap_per_network(conn, out_dir)
+                    logger.info(
+                        "Экспорт «heatmap_networks»: %d сетей, %d сэмплов → %s%s",
+                        result["networks"], result["samples"], out_dir, os.sep,
+                    )
+                    summary.append((
+                        "heatmap_networks",
+                        "{} сетей, {} сэмплов".format(result["networks"], result["samples"]),
+                        out_dir + os.sep,
+                    ))
+
+                elif profile == "heatmap":
+                    out_path = os.path.join(EXPORT_DIR, "heatmap_{}.csv".format(ts))
+                    count = exporter.export_heatmap_csv(conn, out_path, bssid_filter=bssid_filter)
+                    logger.info("Экспорт «heatmap»: %d строк → %s", count, out_path)
+                    summary.append(("heatmap", "{} строк".format(count), out_path))
+
+                elif profile == "wigle":
+                    out_path = os.path.join(EXPORT_DIR, "wigle_{}.csv".format(ts))
+                    count = exporter.export_wigle_csv(conn, out_path)
+                    logger.info("Экспорт «wigle»: %d строк → %s", count, out_path)
+                    summary.append(("wigle", "{} строк".format(count), out_path))
+
+                elif profile == "ap_status":
+                    out_path = os.path.join(EXPORT_DIR, "ap_status_{}.csv".format(ts))
+                    count = exporter.export_ap_status_csv(conn, out_path)
+                    logger.info("Экспорт «ap_status»: %d строк → %s", count, out_path)
+                    summary.append(("ap_status", "{} строк".format(count), out_path))
+
+                else:
+                    logger.warning("Неизвестный профиль экспорта: %s", profile)
+
             except Exception as exc:
                 logger.error("Ошибка экспорта «%s»: %s", profile, exc)
     finally:
         conn.close()
+
+    if summary:
+        ui.console.print(ui.export_summary_table(summary))
 
 
 # ===========================================================================
@@ -754,12 +821,19 @@ def build_parser() -> argparse.ArgumentParser:
              точек и warnings/errors; --debug выводит полную детальность.
              Файл лога (settings.yaml: log_file) всегда пишет полный DEBUG.
 
+профили экспорта (--export, раздел 13 ТЗ):
+  heatmap           тепловая карта: все сети в одном CSV (опц. --export-ssid/--export-bssid)
+  heatmap_networks  тепловая карта ПО КАЖДОЙ СЕТИ: CSV на сеть + манифест (каталог)
+  full              полный датасет: создаются ОБА файла — GeoPackage (.gpkg) и CSV
+  wigle             формат WigleWifi-1.4 (сверка/загрузка на wigle.net)
+  ap_status         результаты проверки точек оператора
+
 примеры:
   sudo python -m src.cli --list
   sudo python -m src.cli                # интерактивное меню
-  sudo python -m src.cli --mode 1 --monitor AA:BB:CC:DD:EE:FF --duration 600 --export heatmap wigle
+  sudo python -m src.cli --mode 1 --monitor AA:BB:CC:DD:EE:FF --duration 600 --export heatmap_networks wigle
   sudo python -m src.cli --mode 2 --client wlan1 --export ap_status
-  sudo python -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 --duration 1800
+  sudo python -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 --duration 1800 --export full
 """,
     )
 
@@ -790,8 +864,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--export", nargs="+", choices=EXPORT_PROFILES, metavar="ПРОФИЛЬ",
                         help="экспортировать профили после работы: "
                              + " | ".join(EXPORT_PROFILES))
-    parser.add_argument("--export-bssid", dest="export_bssid", metavar="AA:BB:CC:DD:EE:FF",
-                        help="фильтр по BSSID для профиля heatmap")
+    export_net_group = parser.add_mutually_exclusive_group()
+    export_net_group.add_argument("--export-ssid", dest="export_ssid", metavar="<имя сети>",
+                        help="фильтр по имени сети для профиля heatmap (обычный способ — "
+                             "MAC знать не нужно; при коллизии имён попросит уточнить "
+                             "через --export-bssid)")
+    export_net_group.add_argument("--export-bssid", dest="export_bssid", metavar="AA:BB:CC:DD:EE:FF",
+                        help="фильтр по MAC для профиля heatmap (только для разрешения "
+                             "коллизии одинаковых имён сетей)")
 
     return parser
 
@@ -816,7 +896,7 @@ def main(argv=None) -> int:
     adapters = adapters_mod.list_wifi_adapters()
 
     if args.list:
-        print(adapters_mod.format_adapters_table(adapters))
+        ui.console.print(ui.adapters_table(adapters))
         return 0
 
     if not adapters:
@@ -865,7 +945,7 @@ def main(argv=None) -> int:
 
         # Экспорт профилей после отработки режима (раздел 13 ТЗ, --export)
         if args.export:
-            do_exports(config["db_path"], args.export, args.export_bssid)
+            do_exports(config["db_path"], args.export, args.export_bssid, args.export_ssid)
 
     finally:
         if gps is not None:
