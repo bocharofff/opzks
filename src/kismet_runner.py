@@ -245,166 +245,252 @@ def stop_kismet(proc):
         logger.error("Ошибка при остановке Kismet: %s", exc)
 
 
-def read_kismet_networks(kismet_db, since_ts=0.0):
-    """
-    Читает устройства типа 'Wi-Fi AP' из Kismet SQLite базы.
+def _open_kismet_ro(kismet_db):
+    """Открывает базу Kismet строго на чтение (mode=ro). None при ошибке.
 
-    База открывается строго на чтение (mode=ro&immutable=1).
-    Возвращает list[dict] с полями:
-        bssid, ssid, encryption, manufacturer, channel, frequency,
-        first_seen, last_seen, best_lat, best_lon, best_signal
-    При ошибке возвращает [].
+    Без immutable=1: Kismet держит файл открытым на запись, а immutable
+    заставляет SQLite читать устаревший page cache (пустые результаты при
+    активной записи).
     """
     if not kismet_db:
-        logger.error("read_kismet_networks: путь к базе Kismet не задан")
-        return []
-
-    import os
+        logger.error("Путь к базе Kismet не задан")
+        return None
     if not os.path.exists(kismet_db):
         logger.warning("База Kismet не найдена: %s", kismet_db)
-        return []
-
-    # mode=ro — только чтение, без immutable: Kismet держит файл открытым
-    # на запись, immutable=1 заставляет SQLite читать устаревший page cache
-    # и может приводить к пустым результатам при активной записи.
-    uri = "file:{}?mode=ro".format(kismet_db)
+        return None
     try:
-        conn = sqlite3.connect(uri, uri=True)
+        conn = sqlite3.connect("file:{}?mode=ro".format(kismet_db), uri=True)
         conn.row_factory = sqlite3.Row
+        return conn
     except sqlite3.OperationalError as exc:
         logger.error("Не удалось открыть базу Kismet (%s): %s", kismet_db, exc)
-        return []
+        return None
 
+
+def read_ap_metadata(kismet_db):
+    """Читает МЕТАДАННЫЕ точек доступа из таблицы ``devices`` (type='Wi-Fi AP').
+
+    Координаты/сигнал из ``devices`` (центроид ``avg_lat/avg_lon``,
+    ``strongest_signal``) НЕ используются — это оценка расположения AP, а нам
+    нужна наша позиция в момент приёма (она берётся из таблицы ``packets``).
+    Здесь — только стабильные атрибуты сети.
+
+    Args:
+        kismet_db: Путь к ``.kismet`` файлу.
+
+    Returns:
+        ``{BSSID_UPPER: {ssid, encryption, manufacturer, channel, frequency}}``.
+        Пустой словарь при ошибке.
+    """
+    conn = _open_kismet_ro(kismet_db)
+    if conn is None:
+        return {}
+
+    meta = {}
     try:
-        # Реальная схема таблицы devices (проверено на живой базе Kismet):
-        # first_time, last_time, devkey, phyname, devmac, strongest_signal,
-        # min_lat, min_lon, max_lat, max_lon, avg_lat, avg_lon, bytes_data, type, device
-        # Колонок min_channel/max_channel/min_freq/max_freq нет —
-        # канал и частота берутся из JSON blob.
+        rows = conn.execute(
+            "SELECT devmac, device FROM devices WHERE type = 'Wi-Fi AP'"
+        ).fetchall()
+        for row in rows:
+            try:
+                blob = _extract_blob(row["device"])
+                meta[row["devmac"].upper()] = {
+                    "ssid":         blob["ssid"],
+                    "encryption":   blob["encryption"],
+                    "manufacturer": blob["manufacturer"],
+                    "channel":      blob.get("channel"),
+                    "frequency":    blob.get("frequency"),
+                }
+            except Exception as exc:
+                logger.warning("Пропуск устройства при чтении метаданных: %s", exc)
+    except sqlite3.Error as exc:
+        logger.error("Ошибка SQL при чтении devices: %s", exc)
+    finally:
+        conn.close()
+
+    logger.debug("Метаданные: %d точек доступа", len(meta))
+    return meta
+
+
+def read_kismet_packets(kismet_db, since_packetid=0, bucket_sec=1):
+    """Читает НОВЫЕ сэмплы сигнала из таблицы ``packets`` (для тепловой карты).
+
+    Каждый beacon/кадр, ИСХОДЯЩИЙ от точки доступа, несёт: сигнал (dBm) и
+    lat/lon — позицию ПРИЁМНИКА (нас) в момент захвата (Kismet штампует из gpsd).
+    Это и есть «где мы были, когда услышали сеть». Читаем инкрементально по
+    ``packetid`` и даунсэмплим до 1 сэмпла на ``bucket_sec`` секунд на BSSID
+    (берём сильнейший сигнал в бакете; lat/lon — из строки с этим MAX).
+
+    Фильтр ``sourcemac IN (SELECT devmac FROM devices WHERE type='Wi-Fi AP')``
+    оставляет только кадры от известных AP и не зависит от лимита параметров.
+
+    Args:
+        kismet_db:      Путь к ``.kismet`` файлу.
+        since_packetid: Читать пакеты с ``packetid`` строго больше этого значения.
+        bucket_sec:     Ширина бакета даунсэмплинга в секундах (>=1).
+
+    Returns:
+        Кортеж ``(samples, last_packetid)``:
+          - ``samples``       — список ``{bssid, signal, lat, lon, ts_sec, frequency}``;
+          - ``last_packetid`` — новый водораздел (max packetid на момент чтения),
+            который нужно передать в следующий вызов. При отсутствии новых данных
+            равен входному ``since_packetid``.
+    """
+    conn = _open_kismet_ro(kismet_db)
+    if conn is None:
+        return [], since_packetid
+
+    bucket = max(1, int(bucket_sec))
+    try:
+        row = conn.execute("SELECT MAX(packetid) AS m FROM packets").fetchone()
+        snapshot_max = row["m"] if row and row["m"] is not None else None
+        if snapshot_max is None or snapshot_max <= since_packetid:
+            return [], since_packetid
+
         rows = conn.execute(
             """
-            SELECT devmac,
-                   avg_lat,  avg_lon,
-                   min_lat,  min_lon,
-                   max_lat,  max_lon,
-                   strongest_signal,
-                   first_time, last_time,
-                   device
-            FROM   devices
-            WHERE  type = 'Wi-Fi AP'
-              AND  last_time > ?
+            SELECT sourcemac      AS bssid,
+                   MAX(signal)    AS signal,
+                   lat, lon,
+                   ts_sec,
+                   frequency
+            FROM   packets
+            WHERE  packetid > :since
+              AND  packetid <= :snap
+              AND  phyname = 'IEEE802.11'
+              AND  signal <> 0
+              AND  sourcemac IN (
+                       SELECT devmac FROM devices WHERE type = 'Wi-Fi AP'
+                   )
+            GROUP  BY sourcemac, ts_sec / :bucket
+            ORDER  BY ts_sec
             """,
-            (int(since_ts),),
+            {"since": since_packetid, "snap": snapshot_max, "bucket": bucket},
         ).fetchall()
-        logger.debug("SQL вернул %d строк из базы Kismet", len(rows))
     except sqlite3.Error as exc:
-        logger.error("Ошибка SQL при чтении базы Kismet: %s", exc)
+        logger.error("Ошибка SQL при чтении packets: %s", exc)
         conn.close()
-        return []
+        return [], since_packetid
 
-    networks = []
-    for row in rows:
+    samples = []
+    for r in rows:
+        # frequency в packets хранится в кГц — переводим в МГц (как в _extract_blob)
+        freq = r["frequency"]
         try:
-            blob_data = _extract_blob(row["device"])
-
-            # Предпочитаем avg-координаты; если нулевые — пробуем max
-            lat = row["avg_lat"]
-            lon = row["avg_lon"]
-            if not _coords_valid(lat, lon):
-                lat = row["max_lat"]
-                lon = row["max_lon"]
-
-            networks.append({
-                "bssid":        row["devmac"],
-                "ssid":         blob_data["ssid"],
-                "encryption":   blob_data["encryption"],
-                "manufacturer": blob_data["manufacturer"],
-                # channel и frequency — только в JSON blob, не в отдельных колонках
-                "channel":      blob_data.get("channel"),
-                "frequency":    blob_data.get("frequency"),
-                "first_seen":   _ts_to_iso(row["first_time"]),
-                "last_seen":    _ts_to_iso(row["last_time"]),
-                "best_lat":     lat if _coords_valid(lat, lon) else None,
-                "best_lon":     lon if _coords_valid(lat, lon) else None,
-                "best_signal":  row["strongest_signal"],
-            })
-        except Exception as exc:
-            logger.warning(
-                "Пропускаем устройство %s: ошибка парсинга: %s",
-                row["devmac"] if "devmac" in row.keys() else "?",
-                exc,
-            )
+            freq_mhz = float(freq) / 1000.0 if freq is not None else None
+        except (TypeError, ValueError):
+            freq_mhz = None
+        samples.append({
+            "bssid":     r["bssid"],
+            "signal":    r["signal"],
+            "lat":       r["lat"],
+            "lon":       r["lon"],
+            "ts_sec":    r["ts_sec"],
+            "frequency": freq_mhz,
+        })
 
     conn.close()
-    logger.debug("Прочитано %d сетей из Kismet (since_ts=%.0f)", len(networks), since_ts)
-    return networks
+    logger.debug(
+        "packets: %d сэмплов (packetid %s..%s, bucket=%ds)",
+        len(samples), since_packetid, snapshot_max, bucket,
+    )
+    return samples, snapshot_max
 
 
-def sync_kismet_to_db(kismet_db, conn, gps, since_ts=0.0):
+def sync_kismet_to_db(kismet_db, conn, gps, since_packetid=0, bucket_sec=1):
+    """Синхронизирует новые данные Kismet в нашу БД: метаданные сетей + сэмплы сигнала.
+
+    Наблюдение = сэмпл сигнала в точке пространства (для тепловой карты).
+    Координата берётся по времени пакета (см. модульный docstring раздела 1 плана):
+      1. валидные ``lat/lon`` из ``packets`` (штамп Kismet = наша позиция тогда);
+      2. иначе ``gps.position_at(ts_sec)`` — наша позиция из трека по времени пакета;
+      3. иначе координат нет → ``has_gps=0`` (в тепловую карту не попадёт).
+    ``gps.latest()`` (позиция «сейчас») к историческим пакетам НЕ привязывается.
+
+    Args:
+        kismet_db:      Путь к ``.kismet`` файлу.
+        conn:           Соединение с нашей БД.
+        gps:            ``GPSMonitor`` или ``None``.
+        since_packetid: Водораздел прошлой синхронизации.
+        bucket_sec:     Ширина бакета даунсэмплинга, секунды.
+
+    Returns:
+        Кортеж ``(count, last_packetid)`` — сколько наблюдений вставлено и новый
+        водораздел для следующего вызова.
     """
-    Читает новые сети из Kismet и сохраняет их в нашу БД.
+    meta = read_ap_metadata(kismet_db)
 
-    Координаты наблюдения:
-      1. best_lat/lon из Kismet (если не нулевые)
-      2. gps.latest() как резерв
-      3. None если ни то, ни другое не доступно
+    # 1. Обновляем метаданные всех известных сетей (идемпотентно)
+    upserted = set()
+    for bssid_up, m in meta.items():
+        try:
+            upsert_network(conn, {
+                "bssid":        bssid_up,
+                "ssid":         m["ssid"],
+                "encryption":   m["encryption"],
+                "manufacturer": m["manufacturer"],
+                "channel":      m["channel"],
+                "frequency":    m["frequency"],
+            })
+            upserted.add(bssid_up)
+        except Exception as exc:
+            logger.error("Ошибка upsert_network %s: %s", bssid_up, exc)
 
-    Делает один conn.commit() в конце.
-    WAL checkpoint каждые 100 вставленных observations.
-    Возвращает количество вставленных observations.
-    """
-    networks = read_kismet_networks(kismet_db, since_ts)
-    if not networks:
-        return 0
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    gps_pos = gps.latest() if gps is not None else None
+    # 2. Читаем новые сэмплы сигнала из packets
+    samples, last_packetid = read_kismet_packets(kismet_db, since_packetid, bucket_sec)
+    if not samples:
+        try:
+            conn.commit()
+        except Exception as exc:
+            logger.error("Ошибка commit при синхронизации (без сэмплов): %s", exc)
+        return 0, last_packetid
 
     count = 0
-    for net in networks:
+    for s in samples:
         try:
-            # 1. Обновляем или вставляем запись о сети
-            upsert_network(conn, {
-                "bssid":        net["bssid"],
-                "ssid":         net["ssid"],
-                "encryption":   net["encryption"],
-                "manufacturer": net["manufacturer"],
-                "channel":      net["channel"],
-                "frequency":    net["frequency"],
-            })
+            bssid = (s["bssid"] or "").upper()
+            if not bssid:
+                continue
 
-            # 2. Определяем координаты для наблюдения
-            lat, lon = None, None
-            if net["best_lat"] is not None and net["best_lon"] is not None:
-                # Kismet знает где видел эту точку — используем его данные
-                lat = net["best_lat"]
-                lon = net["best_lon"]
-            elif gps_pos is not None:
-                # Kismet не дал координаты — берём текущее положение из GPS
-                lat = gps_pos["lat"]
-                lon = gps_pos["lon"]
+            # На случай гонки devices/packets — гарантируем наличие строки сети (FK)
+            if bssid not in upserted:
+                m = meta.get(bssid, {})
+                upsert_network(conn, {
+                    "bssid":        bssid,
+                    "ssid":         m.get("ssid"),
+                    "encryption":   m.get("encryption"),
+                    "manufacturer": m.get("manufacturer"),
+                    "channel":      m.get("channel"),
+                    "frequency":    m.get("frequency"),
+                })
+                upserted.add(bssid)
 
-            # 3. Записываем наблюдение
+            # Координата — по времени пакета, приоритетно из штампа Kismet
+            lat, lon = s["lat"], s["lon"]
+            if not _coords_valid(lat, lon):
+                lat, lon = None, None
+                if gps is not None:
+                    pos = gps.position_at(s["ts_sec"])
+                    if pos is not None:
+                        lat, lon = pos["lat"], pos["lon"]
+
             insert_observation(conn, {
-                "bssid":     net["bssid"],
-                "timestamp": net["last_seen"] or now,
+                "bssid":     bssid,
+                "timestamp": _ts_to_iso(s["ts_sec"]),
                 "lat":       lat,
                 "lon":       lon,
-                "rssi":      net["best_signal"],
-                "channel":   net["channel"],
-                "frequency": net["frequency"],
+                "rssi":      s["signal"],
+                "channel":   meta.get(bssid, {}).get("channel"),
+                "frequency": s["frequency"],
             })
             count += 1
 
-            # WAL checkpoint чтобы не копился большой журнал
             if count % _CHECKPOINT_EVERY == 0:
                 checkpoint(conn)
                 logger.debug("WAL checkpoint после %d записей", count)
 
         except Exception as exc:
-            logger.error(
-                "Ошибка при синхронизации сети %s: %s", net.get("bssid"), exc
-            )
+            logger.error("Ошибка при вставке сэмпла %s: %s", s.get("bssid"), exc)
 
     try:
         conn.commit()
@@ -412,10 +498,10 @@ def sync_kismet_to_db(kismet_db, conn, gps, since_ts=0.0):
         logger.error("Ошибка при commit после синхронизации: %s", exc)
 
     logger.info(
-        "Синхронизация завершена: %d observations, %d сетей из Kismet",
-        count, len(networks),
+        "Синхронизация: %d наблюдений, %d сетей (packetid → %s)",
+        count, len(meta), last_packetid,
     )
-    return count
+    return count, last_packetid
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +575,7 @@ if __name__ == "__main__":
 
             # Читаем базу прямо сейчас (Kismet держит её открытой, но flush уже был)
             try:
-                current = read_kismet_networks(kismet_db_path, since_ts=0.0)
+                current = read_ap_metadata(kismet_db_path)
                 count = len(current)
             except Exception:
                 count = 0
@@ -519,25 +605,33 @@ if __name__ == "__main__":
     # 4. Читаем базу только после остановки — все данные уже на диске
     if kismet_db_path:
         logger.info("=== ШАГ 4: Чтение базы Kismet: %s ===", kismet_db_path)
-        nets = read_kismet_networks(kismet_db_path, since_ts=0.0)
+        meta = read_ap_metadata(kismet_db_path)
+        samples, last_pid = read_kismet_packets(kismet_db_path, since_packetid=0, bucket_sec=1)
 
-        if not nets:
+        if not meta:
             logger.warning("Сетей не найдено. Проверьте что интерфейс был в monitor mode.")
         else:
-            print("\n" + "=" * 90)
-            print("РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ (Найдено сетей: {})".format(len(nets)))
-            print("=" * 90)
-            print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
-                "BSSID", "SSID", "Шифр.", "Канал", "Шир.", "Долг."
+            # Считаем сэмплы (пар «координата→сигнал») на каждую сеть — это и есть
+            # объём данных для тепловой карты.
+            per_bssid = {}
+            for s in samples:
+                b = (s["bssid"] or "").upper()
+                per_bssid[b] = per_bssid.get(b, 0) + 1
+
+            print("\n" + "=" * 92)
+            print("СЕТИ: {}   СЭМПЛОВ СИГНАЛА: {}   (packetid → {})".format(
+                len(meta), len(samples), last_pid))
+            print("=" * 92)
+            print("{:<20} {:<32} {:<10} {:<8} {:<10}".format(
+                "BSSID", "SSID", "Шифр.", "Канал", "Сэмплов"
             ))
-            print("-" * 90)
-            for n in nets:
-                print("{:<20} {:<32} {:<10} {:<8} {:<10} {:<10}".format(
-                    n["bssid"] or "",
-                    (n["ssid"] or "")[:31],
-                    (n["encryption"] or "")[:9],
-                    str(n["channel"] or ""),
-                    str(round(n["best_lat"], 5)) if n["best_lat"] else "No GPS",
-                    str(round(n["best_lon"], 5)) if n["best_lon"] else "No GPS",
+            print("-" * 92)
+            for bssid, m in meta.items():
+                print("{:<20} {:<32} {:<10} {:<8} {:<10}".format(
+                    bssid,
+                    (m["ssid"] or "")[:31],
+                    (m["encryption"] or "")[:9],
+                    str(m["channel"] or ""),
+                    per_bssid.get(bssid, 0),
                 ))
-            print("=" * 90 + "\n")
+            print("=" * 92 + "\n")

@@ -84,6 +84,11 @@ def init_db(path: str) -> sqlite3.Connection:
             lon       REAL,
             has_gps   INTEGER DEFAULT 0
         );
+
+        -- Ускоряет пер-BSSID экспорт тепловой карты (WHERE bssid=? AND has_gps=1)
+        -- на больших объёмах наблюдений (сотни тысяч сэмплов за заезд).
+        CREATE INDEX IF NOT EXISTS idx_obs_bssid_gps
+            ON observations(bssid, has_gps);
     """)
 
     conn.commit()
@@ -246,6 +251,52 @@ def insert_ap_health(conn: sqlite3.Connection, data: dict) -> int:
         data["ap_id"], data["status"], data.get("rtt_ms"),
     )
     return cur.lastrowid
+
+
+def select_recent_networks(conn: sqlite3.Connection, since_iso: str) -> dict:
+    """Возвращает сети, наблюдавшиеся позже ``since_iso`` — «видно сейчас» для режима 3.
+
+    Присутствие определяется пассивно по журналу ``observations``, который в реальном
+    времени наполняет поток монитора. Ключ результата — SSID (матчинг точек оператора
+    идёт по имени сети, BSSID у них нет). ``encryption`` берётся из ``networks`` и служит
+    источником типа шифрования (``security``) при проверке точки.
+
+    Сети без SSID (скрытые/не расшифрованные) пропускаются — по имени их не сматчить.
+
+    Args:
+        conn:      Активное соединение с БД.
+        since_iso: Нижняя граница времени (ISO 8601 UTC), например
+                   ``"2026-06-02T12:00:00Z"``. Берутся наблюдения с ``timestamp > since_iso``.
+
+    Returns:
+        ``{ssid: {"bssid": str, "signal": int|None, "encryption": str|None}}``.
+        Для одного SSID берётся строка с максимальным (сильнейшим) RSSI.
+    """
+    rows = conn.execute(
+        """
+        SELECT n.ssid          AS ssid,
+               o.bssid         AS bssid,
+               MAX(o.rssi)     AS signal,
+               n.encryption    AS encryption
+        FROM   observations o
+        JOIN   networks n ON o.bssid = n.bssid
+        WHERE  o.timestamp > :since
+          AND  n.ssid IS NOT NULL
+          AND  n.ssid <> ''
+        GROUP  BY n.ssid
+        """,
+        {"since": since_iso},
+    ).fetchall()
+
+    result: dict = {}
+    for row in rows:
+        result[row["ssid"]] = {
+            "bssid":      row["bssid"],
+            "signal":     row["signal"],
+            "encryption": row["encryption"],
+        }
+    logger.debug("select_recent_networks: %d сетей с %s", len(result), since_iso)
+    return result
 
 
 def checkpoint(conn: sqlite3.Connection) -> None:

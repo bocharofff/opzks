@@ -9,11 +9,15 @@ src/gps_monitor.py
 
 import logging
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 import gpsd
 
 logger = logging.getLogger(__name__)
+
+# Сколько последних фиксов держать в треке (при опросе ~1/сек — это ~10 минут).
+_TRACK_MAXLEN = 600
 
 
 class GPSMonitor:
@@ -33,6 +37,10 @@ class GPSMonitor:
         self._running = False        # флаг работы фонового потока
         self._thread = None          # ссылка на фоновый поток
         self._lock = threading.Lock()
+        # Трек позиций с привязкой ко времени: deque из (ts_epoch, lat, lon).
+        # Нужен, чтобы восстановить НАШУ позицию на момент конкретного пакета
+        # (position_at), а не позицию конца окна синхронизации.
+        self._track = deque(maxlen=_TRACK_MAXLEN)
 
     # ------------------------------------------------------------------
     # Управление жизненным циклом
@@ -98,9 +106,11 @@ class GPSMonitor:
                         except (AttributeError, TypeError, ValueError):
                             alt = None
 
+                    lat = float(packet.lat)
+                    lon = float(packet.lon)
                     position = {
-                        "lat": float(packet.lat),
-                        "lon": float(packet.lon),
+                        "lat": lat,
+                        "lon": lon,
                         "timestamp": datetime.now(timezone.utc).strftime(
                             "%Y-%m-%dT%H:%M:%SZ"
                         ),
@@ -109,6 +119,9 @@ class GPSMonitor:
                     }
                     with self._lock:
                         self._latest = position
+                        # ts берём по локальным часам приёмника — тем же, по которым
+                        # Kismet проставляет packets.ts_sec (одна машина, один clock).
+                        self._track.append((time.time(), lat, lon))
 
             except Exception as exc:
                 logger.warning("Ошибка при опросе gpsd: %s", exc)
@@ -159,6 +172,44 @@ class GPSMonitor:
         Используется из kismet_runner.py и ap_checker.py.
         """
         return self.get_position()
+
+    def position_at(self, ts_epoch, tol=2.0):
+        """
+        Возвращает НАШУ позицию, ближайшую по времени к ts_epoch (unix-секунды),
+        в пределах допуска tol секунд. Иначе — None.
+
+        В отличие от latest() (позиция «сейчас»), это позиция на момент КОНКРЕТНОГО
+        пакета: для тепловой карты координата наблюдения должна соответствовать тому,
+        ГДЕ МЫ БЫЛИ, когда услышали сеть, а не концу окна синхронизации.
+
+        Args:
+            ts_epoch: Целевое время (unix epoch, секунды). None → None.
+            tol:      Максимально допустимое расхождение по времени, секунды.
+
+        Returns:
+            Словарь ``{'lat': float, 'lon': float}`` или ``None``, если в треке нет
+            фикса ближе tol секунд.
+        """
+        if ts_epoch is None:
+            return None
+        try:
+            target = float(ts_epoch)
+        except (TypeError, ValueError):
+            return None
+
+        best = None
+        best_dt = None
+        with self._lock:
+            snapshot = list(self._track)
+        for ts, lat, lon in snapshot:
+            dt = abs(ts - target)
+            if best_dt is None or dt < best_dt:
+                best_dt = dt
+                best = (lat, lon)
+
+        if best is None or best_dt > tol:
+            return None
+        return {"lat": best[0], "lon": best[1]}
 
     def has_fix(self):
         """

@@ -25,6 +25,14 @@ _DEFAULTS: dict[str, Any] = {
     "sync_interval_sec": 30,
     "log_level":         "INFO",
     "log_file":          "data/wifi_monitor.log",
+    # Тепловая карта: даунсэмплинг сэмплов сигнала (1 сэмпл на N секунд на сеть)
+    "heatmap_sample_sec": 1,
+    # Проверка точек «по присутствию» (разделы плана про режимы 2/3)
+    "presence_window_sec": 45,   # окно «видно сейчас» для режима 3 (по монитору)
+    "recheck_interval_sec": 60,  # кулдаун перепроверки одной и той же точки
+    "scan_interval_sec": 8,      # пауза между сканами/циклами присутствия
+    "min_signal_dbm": None,      # опц. порог: слишком слабые точки не проверять
+    "default_security": "wpa2-psk",  # запасной тип шифрования, если не выведен из эфира
 }
 
 logger = logging.getLogger(__name__)
