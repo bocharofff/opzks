@@ -41,6 +41,9 @@ class GPSMonitor:
         # Нужен, чтобы восстановить НАШУ позицию на момент конкретного пакета
         # (position_at), а не позицию конца окна синхронизации.
         self._track = deque(maxlen=_TRACK_MAXLEN)
+        # Троттлинг warning об ошибках опроса gpsd (иначе при недоступном gpsd
+        # консоль заливается раз в секунду даже в обычном режиме логирования).
+        self._last_gps_warn = 0.0
 
     # ------------------------------------------------------------------
     # Управление жизненным циклом
@@ -124,7 +127,15 @@ class GPSMonitor:
                         self._track.append((time.time(), lat, lon))
 
             except Exception as exc:
-                logger.warning("Ошибка при опросе gpsd: %s", exc)
+                # Троттлинг: не чаще раза в 30с на WARNING, иначе — debug.
+                # Без этого недоступный gpsd заливает консоль раз в секунду
+                # даже в обычном (не-debug) режиме логирования.
+                now = time.time()
+                if now - self._last_gps_warn >= 30:
+                    logger.warning("Ошибка при опросе gpsd: %s", exc)
+                    self._last_gps_warn = now
+                else:
+                    logger.debug("Ошибка при опросе gpsd: %s", exc)
 
             time.sleep(1)
 

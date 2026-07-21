@@ -348,7 +348,7 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
                     kismet_db, conn, gps,
                     since_packetid=last_packetid, bucket_sec=bucket_sec,
                 )
-                logger.info("Синхронизировано наблюдений: %d", count)
+                logger.debug("Синхронизировано наблюдений: %d", count)
             except Exception as exc:
                 logger.error("Ошибка синхронизации Kismet → БД: %s", exc)
             if duration is not None and (time.monotonic() - start) >= duration:
@@ -750,6 +750,10 @@ def build_parser() -> argparse.ArgumentParser:
 режим 2/3: проверка точек «по присутствию» — проверяются только видимые сейчас
            точки (режим 2 — активный скан; режим 3 — пассивно из данных монитора)
 
+логирование: по умолчанию консоль показывает только майлстоуны, итоги проверки
+             точек и warnings/errors; --debug выводит полную детальность.
+             Файл лога (settings.yaml: log_file) всегда пишет полный DEBUG.
+
 примеры:
   sudo python -m src.cli --list
   sudo python -m src.cli                # интерактивное меню
@@ -774,6 +778,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-interval", type=int, default=None, metavar="<сек>",
                         dest="scan_interval",
                         help="пауза между циклами присутствия/сканами (переопределяет settings.yaml)")
+    parser.add_argument("--debug", action="store_true",
+                        help="полная детальность лога в консоли (переопределяет settings.yaml); "
+                             "файл лога всегда пишет полный DEBUG независимо от этого флага")
     parser.add_argument("--list", action="store_true",
                         help="вывести список Wi-Fi адаптеров и выйти")
     parser.add_argument("--no-gps", action="store_true", dest="no_gps",
@@ -800,6 +807,8 @@ def main(argv=None) -> int:
     config = load_config(args.config)
     if args.scan_interval is not None:
         config["scan_interval_sec"] = args.scan_interval
+    if args.debug:
+        config["debug"] = True
     setup_logging(config)
 
     logger.info("=== wifi-monitor — оркестратор ===")

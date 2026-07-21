@@ -138,10 +138,10 @@ def start_kismet(monitor_iface, log_dir="data/", title="scan_wifi",
     if channels:
         ch_str = ",".join(str(c) for c in channels)
         source = "{}:channels={}".format(monitor_iface, ch_str)
-        logger.info("Kismet: список каналов: %s", ch_str)
+        logger.debug("Kismet: список каналов: %s", ch_str)
     else:
         source = monitor_iface
-        logger.info("Kismet: автоматический hopping по всем каналам")
+        logger.debug("Kismet: автоматический hopping по всем каналам")
 
     cmd = [
         "kismet",
@@ -156,8 +156,8 @@ def start_kismet(monitor_iface, log_dir="data/", title="scan_wifi",
     stdout_log = os.path.join(log_dir, "kismet_stdout.log")
     stderr_log = os.path.join(log_dir, "kismet_stderr.log")
 
-    logger.info("Запуск Kismet: %s", " ".join(cmd))
-    logger.info("Логи Kismet: %s / %s", stdout_log, stderr_log)
+    logger.debug("Запуск Kismet: %s", " ".join(cmd))
+    logger.debug("Логи Kismet: %s / %s", stdout_log, stderr_log)
 
     try:
         fout = open(stdout_log, "w")
@@ -203,7 +203,7 @@ def start_kismet(monitor_iface, log_dir="data/", title="scan_wifi",
             )
             break
         if attempt % 5 == 0:
-            logger.info(
+            logger.debug(
                 "Ожидание базы Kismet... %d/%d сек",
                 (attempt + 1) * 2, max_attempts * 2
             )
@@ -497,7 +497,7 @@ def sync_kismet_to_db(kismet_db, conn, gps, since_packetid=0, bucket_sec=1):
     except Exception as exc:
         logger.error("Ошибка при commit после синхронизации: %s", exc)
 
-    logger.info(
+    logger.debug(
         "Синхронизация: %d наблюдений, %d сетей (packetid → %s)",
         count, len(meta), last_packetid,
     )
