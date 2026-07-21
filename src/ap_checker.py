@@ -89,11 +89,14 @@ class APChecker:
     Пароли никогда не попадают в логи, исключения или возвращаемые данные.
     """
 
-    def __init__(self, iface, targets_path, conn, gps, defaults=None):
+    def __init__(self, iface, targets_path, conn, gps, defaults=None,
+                 default_security="wpa2-psk"):
         self.iface = iface
         self.targets_path = targets_path
         self.conn = conn
         self.gps = gps
+        # Запасной тип шифрования: если он не задан у точки и не выведен из эфира
+        self.default_security = (default_security or "wpa2-psk").lower()
         # Объединяем встроенные дефолты с переданными
         self._defaults = dict(_DEFAULTS)
         if defaults:
@@ -159,22 +162,23 @@ class APChecker:
     # Генерация wpa_supplicant.conf
     # ------------------------------------------------------------------
 
-    def _write_wpa_conf(self, ap, use_bssid=True):
+    def _write_wpa_conf(self, ap, security):
         """
         Создаёт временный wpa_supplicant.conf для точки ap.
-        Формат идентичен рабочему test_wpa2.conf.
         Устанавливает права 600. Возвращает путь к файлу.
         Содержимое файла (и пароли) НИКОГДА не логируются.
 
-        use_bssid=True  — привязка к bssid из конфига (точнее, не уведёт
-                          на чужую точку с тем же именем).
-        use_bssid=False — без bssid, цепляемся к любой точке с этим SSID.
-                          Нужно когда у точки рандомизированный/плавающий
-                          MAC (как у iPhone в режиме hotspot).
+        Подключение всегда по имени SSID: у точек оператора нет BSSID
+        (в конфиге только SSID + пароль), поэтому цепляемся к любой точке
+        с этим именем (сильнейшую выбирает wpa_supplicant).
+
+        Args:
+            ap:       Словарь точки (ssid, psk/psk_hash, hidden, ...).
+            security: Уже разрешённый тип шифрования
+                      (open|wpa-psk|wpa2-psk|wpa3-sae).
         """
-        security = (ap.get("security") or "open").lower()
+        security = (security or "open").lower()
         ssid    = ap.get("ssid", "")
-        bssid   = ap.get("bssid") if use_bssid else None
         hidden  = ap.get("hidden", False)
 
         # psk_hash имеет приоритет над psk (уже хешированный, без кавычек)
@@ -196,8 +200,16 @@ class APChecker:
                 "\tpairwise=CCMP\n"
                 "\tgroup=CCMP\n"
             )
+        elif security == "wpa-psk":
+            # Старый WPA1 (без RSN): proto WPA, допускаем TKIP и CCMP
+            auth_block = (
+                "\tkey_mgmt=WPA-PSK\n"
+                "\tproto=WPA\n"
+                "\tpairwise=CCMP TKIP\n"
+                "\tgroup=CCMP TKIP\n"
+            )
         elif security == "wpa3-sae":
-            auth_block = "\tkey_mgmt=SAE\n\tieee80211w=1\n"
+            auth_block = "\tkey_mgmt=SAE\n\tieee80211w=2\n"
         elif security == "wpa2-eap":
             auth_block = "\tkey_mgmt=WPA-EAP\n\tproto=RSN\n"
             # TODO: добавить eap= identity= password= по необходимости
@@ -206,8 +218,6 @@ class APChecker:
             auth_block = "\tkey_mgmt=WPA-PSK\n"
 
         optional = ""
-        if bssid:
-            optional += "\tbssid={}\n".format(bssid)
         if hidden:
             optional += "\tscan_ssid=1\n"
 
@@ -259,42 +269,55 @@ class APChecker:
     # Проверка одной точки
     # ------------------------------------------------------------------
 
-    def check_one(self, ap):
+    def _resolve_security(self, ap, observed_security=None):
+        """Определяет тип шифрования точки: конфиг → наблюдение → дефолт.
+
+        Приоритет:
+          1. ``ap['security']`` — если оператор явно задал в ap_targets.yaml;
+          2. ``observed_security`` — выведенный из эфира (скан/монитор);
+          3. ``self.default_security`` — запасной (обычно ``wpa2-psk``).
+
+        Returns:
+            Строка типа шифрования в нижнем регистре.
         """
-        Проверка одной точки с фоллбэком по BSSID.
+        explicit = (ap.get("security") or "").strip().lower()
+        if explicit:
+            return explicit
+        if observed_security:
+            return observed_security.strip().lower()
+        return self.default_security
 
-        Сначала пробует подключиться с привязкой к bssid из конфига.
-        Если ассоциация не удалась (no_assoc) И в конфиге задан bssid —
-        повторяет попытку без bssid (по одному имени SSID). Это покрывает
-        случай плавающего/рандомизированного MAC точки (iPhone hotspot,
-        приватные MAC). На остальных статусах (no_dhcp/no_dns/no_inet/
-        captive_portal/ok) ретрай не нужен: ассоциация уже состоялась.
+    def check_one(self, ap, observed_security=None):
+        """
+        Проверка одной точки: подключение по SSID + проверка выхода в интернет.
 
-        Возвращает dict: {ap_id, status, rtt_ms, lat, lon, timestamp}.
-        psk/psk_hash НИКОГДА не включаются в результат.
+        BSSID у точек оператора нет — подключаемся по имени сети. Тип шифрования
+        разрешается через :meth:`_resolve_security` (конфиг → наблюдение → дефолт).
+        Для Enterprise (``wpa2-eap``) одного SSID+пароля недостаточно — сразу
+        возвращаем статус ``eap_unsupported``, не тратя попытку и таймауты.
+
+        Args:
+            ap:                Словарь точки из ap_targets.yaml.
+            observed_security: Тип шифрования, наблюдённый в эфире (или None).
+
+        Returns:
+            dict: {ap_id, status, rtt_ms, lat, lon, timestamp}.
+            psk/psk_hash НИКОГДА не включаются в результат.
         """
         ap_id = ap.get("id", "unknown")
-        has_bssid = bool(ap.get("bssid"))
+        security = self._resolve_security(ap, observed_security)
 
-        # Попытка 1: с BSSID (если он есть)
-        status, rtt_ms = self._try_connect(ap, use_bssid=True)
-
-        # Фоллбэк: только если не ассоциировались и BSSID был задан
-        if status == "no_assoc" and has_bssid:
+        if security == "wpa2-eap":
             logger.info(
-                "[%s] Не ассоциировались с BSSID %s — пробуем по имени SSID",
-                ap_id, ap.get("bssid"),
+                "[%s] Тип шифрования Enterprise (802.1X) — только SSID+пароль "
+                "недостаточно, пропускаем", ap_id,
             )
-            status, rtt_ms = self._try_connect(ap, use_bssid=False)
-            if status != "no_assoc":
-                logger.info(
-                    "[%s] Подключение по имени SSID удалось (BSSID сменился)",
-                    ap_id,
-                )
+            return self._make_result(ap_id, "eap_unsupported", None)
 
+        status, rtt_ms = self._try_connect(ap, security)
         return self._make_result(ap_id, status, rtt_ms)
 
-    def _try_connect(self, ap, use_bssid=True):
+    def _try_connect(self, ap, security):
         """
         Одна попытка подключения и проверки через wpa_cli -a action-скрипт.
 
@@ -302,7 +325,7 @@ class APChecker:
         реагирует на CONNECTED и сам запускает dhclient. Поллим появление
         IP-адреса как признак ассоциации + DHCP, затем готовность DNS.
 
-        use_bssid управляет привязкой к bssid (см. _write_wpa_conf).
+        ``security`` — уже разрешённый тип шифрования (см. _resolve_security).
 
         Возвращает кортеж (status, rtt_ms). Результат-dict формирует
         вызывающий check_one. psk/psk_hash НИКОГДА не логируются.
@@ -323,7 +346,7 @@ class APChecker:
             # ----------------------------------------------------------
             # Шаг 1: создаём wpa_supplicant.conf и action-скрипт
             # ----------------------------------------------------------
-            conf_path = self._write_wpa_conf(ap, use_bssid=use_bssid)
+            conf_path = self._write_wpa_conf(ap, security)
             action_path = self._write_action_script()
             pid_path = conf_path + ".pid"
 

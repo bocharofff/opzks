@@ -1,27 +1,26 @@
+# ap_targets.yaml — контролируемые точки доступа оператора
+# Права 600; в экспорт НЕ включается; НЕ коммитить реальные пароли.
+#
+# Из «учётных» данных нужны только имя сети (ssid) и пароль (psk|psk_hash).
+# BSSID не требуется — подключение идёт по имени SSID.
+# security НЕ обязателен: тип шифрования определяется из эфира при наблюдении точки
+# (скан в режиме 2 / данные монитора в режиме 3). Задайте его вручную только чтобы
+# переопределить автоопределение.
+
+# Общие параметры проверки (можно переопределить у точки)
 defaults:
   check_url: "http://connectivitycheck.gstatic.com/generate_204"
   check_timeout_s: 10
   dhcp_timeout_s: 30
-  
+
 access_points:
-  - id: "test-123"
-    ssid: "123"
-    bssid: "4E:F7:B9:66:A3:87"
-    security: "wpa2-psk"
-    psk: "11112222"
-    enabled: false
-
-  - id: "rwalse-rackoo-01"
-    ssid: "Rwalse Rackoo"
-    bssid: "D2:E9:D7:83:AC:74"
-    security: "wpa2-psk"
-    psk: "WAes9711!!"
+  - id: "ap-garage-01"          # человекочитаемый идентификатор
+    ssid: "MyNet_Garage"        # имя сети (обязательно)
+    psk: "<пароль>"             # пароль в открытом виде ЛИБО psk_hash ниже
+    # psk_hash: "5f3c..."       # 64-симв. PSK из wpa_passphrase (предпочтительно)
+    # security: "wpa2-psk"      # опц.: open | wpa-psk | wpa2-psk | wpa3-sae | wpa2-eap
+    # hidden: false             # опц.: скрытая сеть (SSID не вещается)
+    expected_lat: 47.2225       # опц.: координаты установки («должна быть здесь»)
+    expected_lon: 39.7188
     enabled: true
-    notes: "канал 6 (2.4GHz)"
-
-  - id: "mt-free"
-    ssid: "MT_FREE"
-    bssid: "3A:31:74:46:66:4E"
-    security: "wpa2-psk"
-    psk: "qazwsxedcrfv"
-    enabled: false
+    notes: "гараж, северный въезд"

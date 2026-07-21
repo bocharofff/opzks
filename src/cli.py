@@ -20,9 +20,11 @@ src/cli.py — оркестрация всего проекта wifi-monitor.
     sudo python3 -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 \
                             --duration 1800 --export heatmap wigle ap_status
 
-Семантика --duration:
-    режимы 1 и 3 : 0  → работать до Ctrl+C;  N>0 → работать N секунд
-    режим 2      : 0  → один проход по точкам; N>0 → повторять проходы N секунд
+Семантика --duration (для всех режимов одинаково):
+    0  → работать до Ctrl+C;  N>0 → работать N секунд
+
+Режим 2 работает по присутствию: карта периодически сканирует эфир и проверяет
+только видимые сейчас «свои» точки (матчинг по SSID; тип шифрования — из скана).
 """
 
 import argparse
@@ -34,15 +36,16 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.config import load_config, setup_logging, validate_targets_permissions
 from src import adapters as adapters_mod
 from src import interface_manager as ifmgr
 from src.gps_monitor import GPSMonitor
 from src import kismet_runner
+from src import scanner
 from src.ap_checker import APChecker
-from src.db import init_db, insert_ap_health, checkpoint
+from src.db import init_db, insert_ap_health, checkpoint, select_recent_networks
 from src import exporter
 
 logger = logging.getLogger(__name__)
@@ -300,7 +303,7 @@ def setup_gps(config: dict, use_gps: bool):
 # ===========================================================================
 
 def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
-                    sync_interval, stop_event, duration):
+                    sync_interval, stop_event, duration, bucket_sec=1):
     """Полный жизненный цикл пассивного сбора на одной карте.
 
     Шаги: монитор-карта → unmanaged (NetworkManager) → monitor mode →
@@ -309,7 +312,8 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
     восстановление интерфейса. Все ошибки логируются; интерфейс всегда
     восстанавливается в блоке finally.
 
-    duration: число секунд или None (работать до stop_event).
+    duration:   число секунд или None (работать до stop_event).
+    bucket_sec: даунсэмплинг тепловой карты (1 сэмпл на N секунд на сеть).
     """
     orig_iface = monitor_iface
     mon_iface = None
@@ -330,7 +334,7 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
         )
         logger.info("Kismet работает, база: %s", kismet_db)
 
-        last_sync = 0.0  # unix-время предыдущей синхронизации (для WHERE last_time > ?)
+        last_packetid = 0  # водораздел по packetid (инкрементальное чтение packets)
         start = time.monotonic()
 
         while not stop_event.is_set():
@@ -339,13 +343,14 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
                 logger.info("\nСбор данных прерван оператором. Идет остановка процессов...")
                 break
 
-            now = time.time()
             try:
-                count = kismet_runner.sync_kismet_to_db(kismet_db, conn, gps, since_ts=last_sync)
+                count, last_packetid = kismet_runner.sync_kismet_to_db(
+                    kismet_db, conn, gps,
+                    since_packetid=last_packetid, bucket_sec=bucket_sec,
+                )
                 logger.info("Синхронизировано наблюдений: %d", count)
             except Exception as exc:
                 logger.error("Ошибка синхронизации Kismet → БД: %s", exc)
-            last_sync = now
             if duration is not None and (time.monotonic() - start) >= duration:
                 logger.info("Истекло заданное время мониторинга (%d c)", duration)
                 break
@@ -355,7 +360,10 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
         kismet_runner.stop_kismet(proc)
         proc = None
         try:
-            count = kismet_runner.sync_kismet_to_db(kismet_db, conn, gps, since_ts=last_sync)
+            count, last_packetid = kismet_runner.sync_kismet_to_db(
+                kismet_db, conn, gps,
+                since_packetid=last_packetid, bucket_sec=bucket_sec,
+            )
             logger.info("Финальная синхронизация: %d наблюдений", count)
         except Exception as exc:
             logger.error("Ошибка финальной синхронизации: %s", exc)
@@ -384,52 +392,93 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
 # Режим 2 / поток проверки точек оператора
 # ===========================================================================
 
-def ap_check_loop(checker, conn, stop_event, single_pass, duration, pause):
-    """Проход(ы) проверки точек оператора с записью в ap_health.
+def ap_check_loop(checker, conn, stop_event, presence_fn, targets,
+                  recheck_interval, scan_interval, min_signal=None, duration=None):
+    """Проверка точек оператора ПО ФАКТУ ПРИСУТСТВИЯ, с записью в ap_health.
 
-    Между точками и между проходами проверяется stop_event, поэтому остановка
-    (Ctrl+C / завершение режима 3) отрабатывает корректно. Текущая проверка
-    одной точки не прерывается на полпути.
+    На каждой итерации ``presence_fn()`` возвращает сети, видимые прямо сейчас
+    (``{ssid: {bssid, signal, security}}``). Проверяются только те цели, что видны
+    и не находятся в кулдауне — отсутствующие точки не проверяются вовсе, поэтому
+    время не тратится на таймауты неответивших. Матчинг цели с наблюдением — по SSID
+    (BSSID у целей нет). Тип шифрования берётся из наблюдения (``security``).
 
-    single_pass=True  — один проход (режим 2 без --duration).
-    duration=N        — повторять проходы N секунд (None = до stop_event).
+    Args:
+        checker:          Экземпляр APChecker.
+        conn:             Соединение с БД (для ap_health).
+        stop_event:       Событие остановки (Ctrl+C / завершение режима 3).
+        presence_fn:      Callable → ``{ssid: {bssid, signal, security}}``.
+        targets:          Список целей из ap_targets.yaml.
+        recheck_interval: Кулдаун перепроверки одной точки, секунды.
+        scan_interval:    Пауза между циклами присутствия, секунды.
+        min_signal:       Опц. порог dBm — слабее не проверять (None = без порога).
+        duration:         Ограничение по времени, секунды (None = до stop_event).
     """
-    targets = checker.load_targets()
-    if not targets:
-        logger.warning("Нет включённых точек оператора для проверки")
+    by_ssid = {t.get("ssid"): t for t in (targets or []) if t.get("ssid")}
+    if not by_ssid:
+        logger.warning("Нет включённых точек оператора с SSID — проверять нечего")
         return
 
-    start = time.monotonic()
-    pass_no = 0
-    while not stop_event.is_set():
-        pass_no += 1
-        logger.info("=== Проверка точек: проход #%d (%d точек) ===", pass_no, len(targets))
+    logger.info(
+        "Проверка точек по присутствию: %d целей, кулдаун %d c, скан каждые %d c",
+        len(by_ssid), recheck_interval, scan_interval,
+    )
 
-        for ap in targets:
+    last_checked = {}          # ap_id -> monotonic-время последней проверки
+    start = time.monotonic()
+
+    while not stop_event.is_set():
+        try:
+            visible = presence_fn() or {}
+        except Exception as exc:
+            logger.error("Ошибка определения присутствия: %s", exc)
+            visible = {}
+
+        now = time.monotonic()
+        due = []
+        for ssid, info in visible.items():
+            target = by_ssid.get(ssid)
+            if target is None:
+                continue  # чужая сеть — пропуск
+            signal = info.get("signal")
+            if min_signal is not None and signal is not None and signal < min_signal:
+                continue
+            if now - last_checked.get(target.get("id"), 0.0) < recheck_interval:
+                continue
+            due.append((target, info))
+
+        # Сильнейшие первыми (None-сигнал — в конец)
+        due.sort(
+            key=lambda ti: (ti[1].get("signal") is not None, ti[1].get("signal") or -9999),
+            reverse=True,
+        )
+
+        for target, info in due:
             if stop_event.is_set():
                 break
-            ap_id = ap.get("id", "unknown")
-            logger.info("── Проверка точки %s (ssid=%s) ──", ap_id, ap.get("ssid"))
+            ap_id = target.get("id", "unknown")
+            logger.info(
+                "── Проверка точки %s (ssid=%s, сигнал=%s) ──",
+                ap_id, target.get("ssid"), info.get("signal"),
+            )
             try:
-                result = checker.check_one(ap)
+                result = checker.check_one(target, observed_security=info.get("security"))
             except Exception as exc:
                 logger.error("[%s] Ошибка проверки: %s", ap_id, exc)
+                last_checked[ap_id] = time.monotonic()
                 continue
             try:
                 insert_ap_health(conn, result)
                 conn.commit()
             except Exception as exc:
                 logger.error("[%s] Ошибка записи в ap_health: %s", ap_id, exc)
+            last_checked[ap_id] = time.monotonic()
             rtt = "{:.0f} мс".format(result["rtt_ms"]) if result.get("rtt_ms") else "—"
             logger.info("[%s] Результат: %s, RTT: %s", ap_id, result["status"], rtt)
 
-        if single_pass:
-            break
         if duration is not None and (time.monotonic() - start) >= duration:
             logger.info("Истекло время проверки точек (%d c)", duration)
             break
-        logger.info("Пауза %d c перед следующим проходом ...", pause)
-        _sleep_responsive(stop_event, pause)
+        _sleep_responsive(stop_event, scan_interval)
 
 
 # ===========================================================================
@@ -480,6 +529,44 @@ def _print_scan_results(db_path: str) -> None:
         logger.error("Не удалось отобразить результаты сканирования: %s", exc)
 
 
+def _iso_since(window_sec):
+    """ISO8601-UTC метка «now - window_sec» для сравнения с observations.timestamp."""
+    return (datetime.now(timezone.utc) - timedelta(seconds=window_sec)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def make_scan_presence(iface):
+    """Присутствие через активный скан клиентской карты (режим 2).
+
+    Возвращает callable → ``{ssid: {bssid, signal, security}}`` по данным
+    ``iw dev <iface> scan`` (security выводится из beacon-а).
+    """
+    def presence():
+        return scanner.strongest_by_ssid(scanner.scan_visible(iface))
+    return presence
+
+
+def make_db_presence(conn, window_sec):
+    """Присутствие пассивно из наблюдений монитора (режим 3).
+
+    Возвращает callable → ``{ssid: {bssid, signal, security}}`` по сетям,
+    наблюдавшимся за последние ``window_sec`` секунд. ``security`` нормализуется
+    из поля ``encryption`` (Kismet).
+    """
+    def presence():
+        recent = select_recent_networks(conn, _iso_since(window_sec))
+        out = {}
+        for ssid, info in recent.items():
+            out[ssid] = {
+                "bssid":    info.get("bssid"),
+                "signal":   info.get("signal"),
+                "security": scanner.normalize_security(info.get("encryption")),
+            }
+        return out
+    return presence
+
+
 def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
     """Режим 1 — только мониторинг (одна карта в monitor mode) с выводом результатов."""
     conn = _open_db(config["db_path"])
@@ -488,6 +575,7 @@ def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
             conn, gps, monitor_ad["iface"], channels,
             _log_dir(config), KISMET_TITLE, int(config["sync_interval_sec"]),
             stop_event, duration if duration > 0 else None,
+            bucket_sec=int(config["heatmap_sample_sec"]),
         )
     finally:
         # 2. Закрываем соединение с базой (вызовется и при Ctrl+C, и при штатном выходе)
@@ -498,11 +586,12 @@ def run_mode_1(config, monitor_ad, gps, stop_event, duration, channels):
     _print_scan_results(config["db_path"])
 
 
-def run_mode_2(config, client_ad, gps, stop_event, duration, pause):
-    """Режим 2 — только проверка точек оператора (одна карта в managed mode).
+def run_mode_2(config, client_ad, gps, stop_event, duration):
+    """Режим 2 — проверка точек оператора ПО ПРИСУТСТВИЮ (одна managed-карта).
 
-    Клиентская карта остаётся под обычным управлением; APChecker сам
-    запускает wpa_supplicant под каждую точку и убирает за собой.
+    Перед проверками карта активно сканирует эфир (`iw scan`); проверяются только
+    видимые сейчас «свои» точки (матчинг по SSID), тип шифрования — из скана.
+    duration: 0 → до Ctrl+C; N>0 → работать N секунд.
     """
     validate_targets_permissions(config["targets_path"])
     conn = _open_db(config["db_path"])
@@ -512,26 +601,31 @@ def run_mode_2(config, client_ad, gps, stop_event, duration, pause):
             targets_path=config["targets_path"],
             conn=conn,
             gps=gps,
+            default_security=config.get("default_security", "wpa2-psk"),
         )
+        targets = checker.load_targets()
+        presence_fn = make_scan_presence(client_ad["iface"])
         ap_check_loop(
-            checker, conn, stop_event,
-            single_pass=(duration == 0),
+            checker, conn, stop_event, presence_fn, targets,
+            recheck_interval=int(config["recheck_interval_sec"]),
+            scan_interval=int(config["scan_interval_sec"]),
+            min_signal=config.get("min_signal_dbm"),
             duration=(duration if duration > 0 else None),
-            pause=pause,
         )
     finally:
         conn.close()
 
 
-def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels, pause):
+def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels):
     """Режим 3 — мониторинг и проверка точек параллельно на двух картах.
 
     Раздел 7 ТЗ: NetworkManager не отключается полностью — только монитор-карта
     переводится в unmanaged (это делает monitor_collect), клиентская карта
     остаётся управляемой.
 
-    Каждый поток работает со своей связью к БД (WAL + busy_timeout допускают
-    одновременную запись), GPS-объект общий и потокобезопасный.
+    Присутствие для проверки берётся ПАССИВНО из наблюдений монитора (без активного
+    скана на клиентской карте — она свободна для подключений). Каждый поток работает
+    со своей связью к БД (WAL + busy_timeout), GPS-объект общий и потокобезопасный.
     """
     validate_targets_permissions(config["targets_path"])
     conn_mon = _open_db(config["db_path"])
@@ -542,7 +636,7 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
         name="monitor",
         args=(conn_mon, gps, monitor_ad["iface"], channels,
               _log_dir(config), KISMET_TITLE, int(config["sync_interval_sec"]),
-              stop_event, None),
+              stop_event, None, int(config["heatmap_sample_sec"])),
         daemon=True,
     )
     checker = APChecker(
@@ -550,11 +644,16 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
         targets_path=config["targets_path"],
         conn=conn_ap,
         gps=gps,
+        default_security=config.get("default_security", "wpa2-psk"),
     )
+    targets = checker.load_targets()
+    presence_fn = make_db_presence(conn_ap, int(config["presence_window_sec"]))
     ap_thread = threading.Thread(
         target=ap_check_loop,
         name="ap-check",
-        args=(checker, conn_ap, stop_event, False, None, pause),
+        args=(checker, conn_ap, stop_event, presence_fn, targets,
+              int(config["recheck_interval_sec"]), int(config["scan_interval_sec"]),
+              config.get("min_signal_dbm"), None),
         daemon=True,
     )
 
@@ -647,9 +746,9 @@ def build_parser() -> argparse.ArgumentParser:
   2  проверка точек оператора, 1 карта в managed mode
   3  оба режима одновременно, 2 разные карты
 
---duration:
-  режимы 1 и 3 : 0 -> до Ctrl+C; N>0 -> N секунд
-  режим 2      : 0 -> один проход; N>0 -> повторять проходы N секунд
+--duration (все режимы): 0 -> до Ctrl+C; N>0 -> N секунд
+режим 2/3: проверка точек «по присутствию» — проверяются только видимые сейчас
+           точки (режим 2 — активный скан; режим 3 — пассивно из данных монитора)
 
 примеры:
   sudo python -m src.cli --list
@@ -672,9 +771,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="список каналов для Kismet; без него — авто-hopping")
     parser.add_argument("--duration", type=int, default=0, metavar="<сек>",
                         help="длительность работы; см. справку (default: 0)")
-    parser.add_argument("--ap-pause", type=int, default=5, metavar="<сек>",
-                        dest="ap_pause",
-                        help="пауза между проходами проверки точек (default: 5)")
+    parser.add_argument("--scan-interval", type=int, default=None, metavar="<сек>",
+                        dest="scan_interval",
+                        help="пауза между циклами присутствия/сканами (переопределяет settings.yaml)")
     parser.add_argument("--list", action="store_true",
                         help="вывести список Wi-Fi адаптеров и выйти")
     parser.add_argument("--no-gps", action="store_true", dest="no_gps",
@@ -699,6 +798,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
+    if args.scan_interval is not None:
+        config["scan_interval_sec"] = args.scan_interval
     setup_logging(config)
 
     logger.info("=== wifi-monitor — оркестратор ===")
@@ -751,7 +852,7 @@ def main(argv=None) -> int:
             logger.info("Роль КЛИЕНТ: %s (MAC %s, USB %s)",
                         client_ad["iface"], client_ad["mac"], client_ad.get("usb_path"))
 
-        run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, args.ap_pause, mode)
+        run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, mode)
 
         # Экспорт профилей после отработки режима (раздел 13 ТЗ, --export)
         if args.export:
@@ -765,7 +866,7 @@ def main(argv=None) -> int:
     return 0
 
 
-def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause, mode):
+def run_mode(config, monitor_ad, client_ad, gps, duration, channels, mode):
     """Настраивает обработчики сигналов и запускает выбранный режим один раз."""
     stop_event = threading.Event()
 
@@ -779,9 +880,9 @@ def run_mode(config, monitor_ad, client_ad, gps, duration, channels, ap_pause, m
     if mode == 1:
         run_mode_1(config, monitor_ad, gps, stop_event, duration, channels)
     elif mode == 2:
-        run_mode_2(config, client_ad, gps, stop_event, duration, ap_pause)
+        run_mode_2(config, client_ad, gps, stop_event, duration)
     elif mode == 3:
-        run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels, ap_pause)
+        run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels)
 
 
 if __name__ == "__main__":
