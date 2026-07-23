@@ -7,16 +7,27 @@ src/ap_checker.py
 
 Используется из src/cli.py (режимы 2 и 3).
 
-Механизм ассоциации: wpa_supplicant (-B -P pidfile) + wpa_cli -a action-скрипт.
-Action-скрипт реагирует на событие CONNECTED, поднимает интерфейс и запускает
-dhclient. Скрипт поллит появление IP-адреса и nameserver в resolv.conf.
+Механизм ассоциации: временный connection-профиль NetworkManager
+(``nmcli connection add`` → ``up`` → ``down`` → ``delete``).
+
+Почему не отдельный wpa_supplicant (было раньше): клиентская карта намеренно
+остаётся под управлением NetworkManager (раздел 7 ТЗ, критерий приёмки §17 —
+«без отключения сетевого менеджера для клиентской карты»). NetworkManager сам
+держит собственный процесс wpa_supplicant на managed-интерфейсе (D-Bus/systemd,
+переживает killall и почти мгновенно перезапускается). Интерфейс физически не
+может одновременно принадлежать двум процессам wpa_supplicant — раньше
+`killall wpa_supplicant` валил supplicant NetworkManager'а, тот тут же
+поднимался заново и отбирал интерфейс обратно, из-за чего проверка стабильно
+падала в ``no_assoc`` (см. журнал реального прогона на Kali). Теперь ассоциацию
+и DHCP выполняет сам NetworkManager — конфликта на уровне netlink/ctrl_iface
+больше нет.
 """
 
 import logging
 import os
 import subprocess
-import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -33,19 +44,27 @@ _DEFAULTS = {
     "dhcp_timeout_s":  30,
 }
 
-# action-скрипт для wpa_cli -a.
-# wpa_cli вызывает его с аргументами: <iface> <event>.
-# event = CONNECTED при успешной ассоциации, DISCONNECTED при разрыве.
-_WPA_ACTION_SCRIPT = """#!/bin/bash
-IFACE="$1"
-CMD="$2"
-logger "wpa_action: iface=$IFACE cmd=$CMD"
-if [ "$CMD" = "CONNECTED" ]; then
-    ip link set "$IFACE" up
-    dhclient -r "$IFACE" 2>/dev/null
-    dhclient -v "$IFACE"
-fi
-"""
+# Причины отказа NetworkManager (GENERAL.STATE-REASON из `nmcli device show`),
+# связанные именно с получением IP по DHCP — всё остальное (нет секретов/
+# неверный пароль, таймаут supplicant, сеть не найдена и т.п.) трактуется как
+# проблема ассоциации (no_assoc), это же и консервативный дефолт для
+# нераспознанной причины. Источник перечня причин (NMDeviceStateReason):
+# https://lazka.github.io/pgi-docs/NM-1.0/enums.html
+#
+# ВАЖНО: точный формат строки GENERAL.STATE-REASON у nmcli варьируется между
+# версиями (иногда только код, иногда код+текст в скобках) — сюда заложены
+# оба варианта написания (kebab-case и с подчёркиванием) как подстроки для
+# терпимого сопоставления. Не проверено на живом NetworkManager — сырые
+# state/reason всегда логируются на INFO при отказе, чтобы список было легко
+# донастроить по факту (см. classify_nm_failure).
+_NM_DHCP_FAIL_HINTS = (
+    "ip-config-unavailable", "ip_config_unavailable",
+    "ip-config-expired", "ip_config_expired",
+    "dhcp-start-failed", "dhcp_start_failed",
+    "dhcp-error", "dhcp_error",
+    "dhcp-failed", "dhcp_failed",
+    "dhcp timeout",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +94,73 @@ def _run(cmd, timeout=15):
 
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def classify_nm_failure(reason):
+    """Классифицирует причину отказа активации NetworkManager в наш статус.
+
+    ``reason`` — строка ``GENERAL.STATE-REASON`` (``nmcli -t -f
+    GENERAL.STATE-REASON device show <iface>``) после неудачного
+    ``nmcli connection up``.
+
+    Args:
+        reason: Сырая строка причины от nmcli (или None/пусто).
+
+    Returns:
+        ``"no_dhcp"`` — причина связана с получением IP по DHCP;
+        ``"no_assoc"`` — всё остальное, включая нераспознанную причину
+        (консервативный дефолт, как и было до перехода на nmcli).
+    """
+    text = (reason or "").strip().lower()
+    if any(hint in text for hint in _NM_DHCP_FAIL_HINTS):
+        return "no_dhcp"
+    return "no_assoc"
+
+
+def _build_nmcli_add_cmd(con_name, iface, ap, security):
+    """Строит команду ``nmcli connection add`` для временного профиля точки.
+
+    Подключение всегда по имени SSID: у точек оператора нет BSSID (в конфиге
+    только SSID + пароль) — цепляемся к сильнейшей точке с этим именем,
+    выбор делает сам NetworkManager.
+
+    Args:
+        con_name: Уникальное имя временного профиля (удаляется после проверки).
+        iface:    Managed-интерфейс, на котором создаётся профиль.
+        ap:       Словарь точки (ssid, psk/psk_hash, hidden, ...).
+        security: Уже разрешённый тип шифрования (см. _resolve_security):
+                  ``open|wep|wpa-psk|wpa2-psk|wpa3-sae``.
+
+    Returns:
+        Список токенов команды (без shell — пароль как отдельный argv-элемент,
+        экранирование не требуется).
+    """
+    ssid = ap.get("ssid", "")
+    hidden = ap.get("hidden", False)
+    secret = ap.get("psk_hash") or ap.get("psk") or ""
+
+    cmd = [
+        "nmcli", "connection", "add",
+        "type", "wifi",
+        "con-name", con_name,
+        "ifname", iface,
+        "ssid", ssid,
+        "connection.autoconnect", "no",
+    ]
+    if hidden:
+        cmd += ["802-11-wireless.hidden", "yes"]
+
+    security = (security or "open").lower()
+    if security == "open":
+        pass  # без wifi-sec.* — открытая сеть, ключ не нужен
+    elif security == "wep":
+        cmd += ["wifi-sec.key-mgmt", "none", "wifi-sec.wep-key0", secret]
+    elif security == "wpa3-sae":
+        cmd += ["wifi-sec.key-mgmt", "sae", "wifi-sec.psk", secret]
+    else:
+        # wpa-psk / wpa2-psk и запасной случай для нераспознанного типа
+        cmd += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", secret]
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -159,113 +245,6 @@ class APChecker:
         return targets
 
     # ------------------------------------------------------------------
-    # Генерация wpa_supplicant.conf
-    # ------------------------------------------------------------------
-
-    def _write_wpa_conf(self, ap, security):
-        """
-        Создаёт временный wpa_supplicant.conf для точки ap.
-        Устанавливает права 600. Возвращает путь к файлу.
-        Содержимое файла (и пароли) НИКОГДА не логируются.
-
-        Подключение всегда по имени SSID: у точек оператора нет BSSID
-        (в конфиге только SSID + пароль), поэтому цепляемся к любой точке
-        с этим именем (сильнейшую выбирает wpa_supplicant).
-
-        Args:
-            ap:       Словарь точки (ssid, psk/psk_hash, hidden, ...).
-            security: Уже разрешённый тип шифрования
-                      (open|wpa-psk|wpa2-psk|wpa3-sae).
-        """
-        security = (security or "open").lower()
-        ssid    = ap.get("ssid", "")
-        hidden  = ap.get("hidden", False)
-
-        # psk_hash имеет приоритет над psk (уже хешированный, без кавычек)
-        psk_line = ""
-        if security not in ("open",):
-            if ap.get("psk_hash"):
-                psk_line = "\tpsk={}\n".format(ap["psk_hash"])
-            elif ap.get("psk"):
-                psk_line = '\tpsk="{}"\n'.format(ap["psk"])
-
-        # Формируем блок network={}
-        if security == "open":
-            auth_block = "\tkey_mgmt=NONE\n"
-        elif security == "wpa2-psk":
-            # group=CCMP добавлен явно — как в рабочем test_wpa2.conf
-            auth_block = (
-                "\tkey_mgmt=WPA-PSK\n"
-                "\tproto=RSN\n"
-                "\tpairwise=CCMP\n"
-                "\tgroup=CCMP\n"
-            )
-        elif security == "wpa-psk":
-            # Старый WPA1 (без RSN): proto WPA, допускаем TKIP и CCMP
-            auth_block = (
-                "\tkey_mgmt=WPA-PSK\n"
-                "\tproto=WPA\n"
-                "\tpairwise=CCMP TKIP\n"
-                "\tgroup=CCMP TKIP\n"
-            )
-        elif security == "wpa3-sae":
-            auth_block = "\tkey_mgmt=SAE\n\tieee80211w=2\n"
-        elif security == "wpa2-eap":
-            auth_block = "\tkey_mgmt=WPA-EAP\n\tproto=RSN\n"
-            # TODO: добавить eap= identity= password= по необходимости
-        else:
-            logger.warning("Неизвестный тип security '%s', использую WPA-PSK", security)
-            auth_block = "\tkey_mgmt=WPA-PSK\n"
-
-        optional = ""
-        if hidden:
-            optional += "\tscan_ssid=1\n"
-
-        # ctrl_interface и group — как в рабочем конфиге (путь + group=0,
-        # а не DIR=... GROUP=netdev)
-        conf = (
-            "ctrl_interface=/var/run/wpa_supplicant\n"
-            "ctrl_interface_group=0\n"
-            "network={{\n"
-            "\tssid=\"{ssid}\"\n"
-            "{auth}{psk}{optional}"
-            "}}\n"
-        ).format(
-            ssid=ssid,
-            auth=auth_block,
-            psk=psk_line,
-            optional=optional,
-        )
-
-        fd, path = tempfile.mkstemp(suffix=".conf", prefix="wpa_ap_")
-        try:
-            os.write(fd, conf.encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.chmod(path, 0o600)
-        # Логируем только путь, НИКОГДА не содержимое
-        logger.debug("wpa_supplicant.conf создан: %s (ssid=%s)", path, ssid)
-        return path
-
-    # ------------------------------------------------------------------
-    # Генерация action-скрипта для wpa_cli
-    # ------------------------------------------------------------------
-
-    def _write_action_script(self):
-        """
-        Создаёт временный action-скрипт для wpa_cli -a.
-        Права 700 (исполняемый). Возвращает путь.
-        """
-        fd, path = tempfile.mkstemp(suffix=".sh", prefix="wpa_action_")
-        try:
-            os.write(fd, _WPA_ACTION_SCRIPT.encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.chmod(path, 0o700)
-        logger.debug("action-скрипт создан: %s", path)
-        return path
-
-    # ------------------------------------------------------------------
     # Проверка одной точки
     # ------------------------------------------------------------------
 
@@ -319,11 +298,12 @@ class APChecker:
 
     def _try_connect(self, ap, security):
         """
-        Одна попытка подключения и проверки через wpa_cli -a action-скрипт.
+        Одна попытка подключения через временный connection-профиль NetworkManager.
 
-        wpa_supplicant запускается с PID-файлом, wpa_cli с action-скриптом
-        реагирует на CONNECTED и сам запускает dhclient. Поллим появление
-        IP-адреса как признак ассоциации + DHCP, затем готовность DNS.
+        Клиентская карта остаётся managed (раздел 7 ТЗ) — ассоциацию и DHCP
+        выполняет сам NetworkManager (``nmcli connection up``), а не отдельный
+        wpa_supplicant: см. объяснение в докстринге модуля (два wpa_supplicant
+        не могут одновременно владеть одним интерфейсом).
 
         ``security`` — уже разрешённый тип шифрования (см. _resolve_security).
 
@@ -335,109 +315,58 @@ class APChecker:
         check_timeout_s = int(ap.get("check_timeout_s", self._defaults["check_timeout_s"]))
         check_url       = ap.get("check_url", self._defaults["check_url"])
 
-        status       = "error"
-        rtt_ms       = None
-        conf_path    = None
-        action_path  = None
-        pid_path     = None
-        wpa_cli_proc = None
+        con_name = "wifi-monitor-check-{}".format(uuid.uuid4().hex[:8])
+        status = "error"
+        rtt_ms = None
+        connection_created = False
 
         try:
             # ----------------------------------------------------------
-            # Шаг 1: создаём wpa_supplicant.conf и action-скрипт
+            # Шаг 1: создаём временный connection-профиль под эту точку
             # ----------------------------------------------------------
-            conf_path = self._write_wpa_conf(ap, security)
-            action_path = self._write_action_script()
-            pid_path = conf_path + ".pid"
-
-            # ----------------------------------------------------------
-            # Шаг 2: полная очистка состояния ПЕРЕД подключением,
-            #        затем запуск нового wpa_supplicant (-B -P).
-            #
-            # Без этого dhclient на следующем прогоне спотыкается на
-            # "Error: ipv4: Address already assigned" — старый IP с прошлой
-            # проверки остаётся на интерфейсе, и первый DHCP-цикл сбоит,
-            # из-за чего DNS встаёт с большой задержкой.
-            # ----------------------------------------------------------
-            # 2a. Гасим старый wpa_supplicant
-            _run(["killall", "wpa_supplicant"], timeout=5)
-            time.sleep(1)
-            # 2b. Удаляем осиротевший ctrl_interface сокет, иначе новый
-            #     процесс упадёт на "Failed to initialize control interface"
-            _run(["rm", "-f", "/var/run/wpa_supplicant/{}".format(self.iface)], timeout=5)
-            # 2c. Освобождаем старую DHCP-аренду (если dhclient её держит)
-            _run(["dhclient", "-r", self.iface], timeout=5)
-            # 2d. Гасим возможные осиротевшие dhclient на этом интерфейсе
-            _run(["pkill", "-f", "dhclient.*{}".format(self.iface)], timeout=5)
-            # 2e. Сбрасываем все IP-адреса с интерфейса
-            _run(["ip", "addr", "flush", "dev", self.iface], timeout=5)
-            # 2f. Поднимаем интерфейс (flush мог его не тронуть, но на всякий)
-            _run(["ip", "link", "set", self.iface, "up"], timeout=5)
-
-            rc, stdout, stderr = _run(
-                ["wpa_supplicant", "-B", "-i", self.iface,
-                 "-c", conf_path, "-P", pid_path],
-                timeout=10,
-            )
+            add_cmd = _build_nmcli_add_cmd(con_name, self.iface, ap, security)
+            rc, stdout, stderr = _run(add_cmd, timeout=10)
             if rc != 0:
                 logger.warning(
-                    "[%s] wpa_supplicant не запустился (rc=%d): stdout=%r stderr=%r",
-                    ap_id, rc, stdout.strip(), stderr.strip(),
+                    "[%s] nmcli connection add не удался (rc=%d): %s",
+                    ap_id, rc, stderr.strip(),
                 )
-                status = "no_assoc"
-                return status, rtt_ms
-
-            # ----------------------------------------------------------
-            # Шаг 3: запускаем wpa_cli -a в фоне (Popen, не _run).
-            # Он сам поднимет интерфейс и запустит dhclient по CONNECTED.
-            # ----------------------------------------------------------
-            try:
-                wpa_cli_proc = subprocess.Popen(
-                    ["wpa_cli", "-i", self.iface, "-a", action_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as exc:
-                logger.warning("[%s] не удалось запустить wpa_cli -a: %s", ap_id, exc)
                 status = "error"
                 return status, rtt_ms
+            connection_created = True
 
             # ----------------------------------------------------------
-            # Шаг 4: ждём появления IP (action-скрипт уже сделал dhclient)
+            # Шаг 2: активация — NetworkManager сам делает ассоциацию + DHCP.
+            # -w ограничивает ожидание тем же таймаутом, что раньше был на
+            # DHCP (ассоциация+DHCP теперь один шаг с точки зрения nmcli).
             # ----------------------------------------------------------
-            got_ip = False
-            for _ in range(dhcp_timeout_s):
-                time.sleep(1)
-                _, addr_out, _ = _run(["ip", "addr", "show", self.iface], timeout=5)
-                if "inet " in addr_out:
-                    got_ip = True
-                    logger.debug("[%s] IP получен", ap_id)
-                    break
-
-            if not got_ip:
-                # Различаем "не ассоциировались" и "ассоциировались, но нет DHCP"
-                _, link_out, _ = _run(["iw", "dev", self.iface, "link"], timeout=5)
-                if "Connected" in link_out:
-                    logger.debug("[%s] Ассоциация есть, но IP не получен", ap_id)
-                    status = "no_dhcp"
-                else:
-                    logger.debug("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
-                    status = "no_assoc"
+            rc, stdout, stderr = _run(
+                ["nmcli", "-w", str(dhcp_timeout_s), "connection", "up",
+                 con_name, "ifname", self.iface],
+                timeout=dhcp_timeout_s + 10,
+            )
+            if rc != 0:
+                state, reason = self._get_nm_device_state()
+                logger.info(
+                    "[%s] Активация не удалась: state=%s reason=%s (nmcli: %s)",
+                    ap_id, state, reason, stderr.strip(),
+                )
+                status = classify_nm_failure(reason)
                 return status, rtt_ms
 
             # ----------------------------------------------------------
-            # Шаг 5: ждём готовности DNS — реальной попыткой резолва.
+            # Шаг 3: ждём готовности DNS — реальной попыткой резолва.
             #
-            # Проверка "nameserver in resolv.conf" ненадёжна: строка есть,
-            # но сервер ещё не отвечает / маршрут не готов. Резолвим сам хост
-            # тем же резолвером, что потом использует requests. Окно 25с —
-            # на реальной точке от ассоциации до рабочего DNS уходит ~15-20с.
+            # К моменту "activated" NetworkManager уже настроил IP и DNS
+            # из DHCP, но резолвер может быть готов на долю секунды позже —
+            # оставляем то же окно 25с защитной сеткой (было нужно для
+            # прежнего dhclient-based пути, здесь скорее подстраховка).
             # ----------------------------------------------------------
             import socket
             from urllib.parse import urlparse
 
             check_host = urlparse(check_url).hostname or ""
-            logger.debug("[%s] IP получен, ждём резолва %s...", ap_id, check_host)
+            logger.debug("[%s] Подключено, ждём резолва %s...", ap_id, check_host)
 
             dns_ready = False
             for _ in range(25):
@@ -460,7 +389,7 @@ class APChecker:
                 return status, rtt_ms
 
             # ----------------------------------------------------------
-            # Шаг 6: HTTP-проверка
+            # Шаг 4: HTTP-проверка
             # ----------------------------------------------------------
             t0 = time.monotonic()
             try:
@@ -494,7 +423,7 @@ class APChecker:
             # ----------------------------------------------------------
             # Cleanup — выполняется всегда
             # ----------------------------------------------------------
-            self._cleanup(conf_path, action_path, pid_path, wpa_cli_proc)
+            self._cleanup_nm_connection(con_name, connection_created)
 
         return status, rtt_ms
 
@@ -516,51 +445,47 @@ class APChecker:
             "lon":       pos["lon"] if pos else None,
         }
 
-    def _cleanup(self, conf_path, action_path=None, pid_path=None, wpa_cli_proc=None):
+    def _get_nm_device_state(self):
+        """Читает состояние интерфейса из NetworkManager после неудачной активации.
+
+        Возвращает ``(state, reason)`` — сырые строки ``GENERAL.STATE`` /
+        ``GENERAL.STATE-REASON`` из ``nmcli device show``, для классификации
+        (:func:`classify_nm_failure`) и логирования. При ошибке запроса —
+        ``(None, None)``, исключений не бросает.
         """
-        Гасит wpa_cli -a, останавливает wpa_supplicant, сбрасывает IP,
-        удаляет временные файлы. Все ошибки логируются, не пробрасываются.
+        rc, stdout, _ = _run(
+            ["nmcli", "-t", "-f", "GENERAL.STATE,GENERAL.STATE-REASON",
+             "device", "show", self.iface],
+            timeout=5,
+        )
+        if rc != 0:
+            return None, None
+        state, reason = None, None
+        for line in stdout.splitlines():
+            if line.startswith("GENERAL.STATE:"):
+                state = line.split(":", 1)[1].strip()
+            elif line.startswith("GENERAL.STATE-REASON:"):
+                reason = line.split(":", 1)[1].strip()
+        return state, reason
+
+    def _cleanup_nm_connection(self, con_name, created):
         """
-        # Гасим фоновый wpa_cli -a
-        if wpa_cli_proc is not None:
-            try:
-                wpa_cli_proc.terminate()
-                wpa_cli_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    wpa_cli_proc.kill()
-                except Exception:
-                    pass
+        Деактивирует и удаляет временный connection-профиль ``con_name``.
+        Все ошибки логируются, не пробрасываются.
 
-        # Останавливаем wpa_supplicant по PID-файлу, если есть
-        killed = False
-        if pid_path and os.path.exists(pid_path):
-            try:
-                with open(pid_path) as fh:
-                    pid = int(fh.read().strip())
-                os.kill(pid, 15)
-                killed = True
-            except (OSError, ValueError) as exc:
-                logger.debug("Не удалось убить по PID-файлу: %s", exc)
-
-        if not killed:
-            rc, _, _ = _run(["wpa_cli", "-i", self.iface, "terminate"], timeout=5)
-            if rc != 0:
-                # Fallback: pkill если wpa_cli не сработал
-                _run(["pkill", "-f", "wpa_supplicant.*{}".format(self.iface)], timeout=5)
-
-        # Освобождаем аренду DHCP и сбрасываем IP
-        _run(["dhclient", "-r", self.iface], timeout=5)
-        _run(["ip", "addr", "flush", "dev", self.iface], timeout=5)
-
-        # Удаляем временные файлы (conf содержит пароль)
-        for p in (conf_path, action_path, pid_path):
-            if p and os.path.exists(p):
-                try:
-                    os.unlink(p)
-                    logger.debug("Удалён временный файл: %s", p)
-                except OSError as exc:
-                    logger.error("Не удалось удалить %s: %s", p, exc)
+        Args:
+            con_name: Имя временного профиля (см. _try_connect).
+            created:  ``False``, если профиль не был создан (ошибка на самом
+                      первом шаге) — тогда удалять нечего.
+        """
+        if not created:
+            return
+        _run(["nmcli", "connection", "down", con_name], timeout=10)
+        rc, _, stderr = _run(["nmcli", "connection", "delete", con_name], timeout=10)
+        if rc != 0:
+            logger.warning(
+                "Не удалось удалить временный профиль %s: %s", con_name, stderr.strip(),
+            )
 
     # ------------------------------------------------------------------
     # Обход всех точек
@@ -621,8 +546,8 @@ if __name__ == "__main__":
   sudo python3 -m src.ap_checker wlan0 config/ap_targets.yaml
 
 Требования:
-  - <интерфейс> должен быть в managed mode (не monitor)
-  - wpa_supplicant, wpa_cli, dhclient, iw должны быть установлены
+  - <интерфейс> должен быть под управлением NetworkManager (managed, не monitor)
+  - nmcli должен быть установлен и NetworkManager запущен
   - ap_targets.yaml должен иметь права 600
 """.strip()
 

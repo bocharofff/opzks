@@ -24,7 +24,7 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
-# Канонические типы шифрования, которые понимает ap_checker._write_wpa_conf
+# Канонические типы шифрования, которые понимает ap_checker._build_nmcli_add_cmd
 SEC_OPEN = "open"
 SEC_WPA = "wpa-psk"
 SEC_WPA2 = "wpa2-psk"

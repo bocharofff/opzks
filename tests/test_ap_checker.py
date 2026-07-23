@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-tests/test_ap_checker.py — резолв типа шифрования, генерация wpa_supplicant.conf,
-статус eap_unsupported, отсутствие пароля в результате.
+tests/test_ap_checker.py — резолв типа шифрования, сборка команды nmcli
+connection add, классификация причин отказа NetworkManager, статус
+eap_unsupported, отсутствие пароля в результате.
 """
 
-import os
-
-from src.ap_checker import APChecker
+from src.ap_checker import APChecker, _build_nmcli_add_cmd, classify_nm_failure
 
 
 def _checker(default_security="wpa2-psk"):
@@ -43,46 +42,83 @@ def test_resolve_security_falls_back_to_default():
 
 
 # ---------------------------------------------------------------------------
-# _write_wpa_conf — корректный key_mgmt и отсутствие bssid
+# _build_nmcli_add_cmd — корректный key-mgmt, отсутствие bssid, приоритет
+# psk_hash над psk, hidden-флаг
 # ---------------------------------------------------------------------------
 
-def _conf_text(ap, security):
-    c = _checker()
-    path = c._write_wpa_conf(ap, security)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
+def _arg_after(cmd, key):
+    """Возвращает значение, следующее сразу за токеном ``key`` в списке argv."""
+    idx = cmd.index(key)
+    return cmd[idx + 1]
 
 
-def test_write_conf_wpa2_psk():
-    text = _conf_text({"ssid": "MyNet", "psk": "secretpass"}, "wpa2-psk")
-    assert 'ssid="MyNet"' in text
-    assert "key_mgmt=WPA-PSK" in text
-    assert "proto=RSN" in text
-    assert 'psk="secretpass"' in text
-    assert "bssid=" not in text          # BSSID больше не используется
+def test_nmcli_add_cmd_wpa2_psk():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "MyNet", "psk": "secretpass"}, "wpa2-psk")
+    assert _arg_after(cmd, "ssid") == "MyNet"
+    assert _arg_after(cmd, "ifname") == "wlan1"
+    assert _arg_after(cmd, "con-name") == "con1"
+    assert _arg_after(cmd, "wifi-sec.key-mgmt") == "wpa-psk"
+    assert _arg_after(cmd, "wifi-sec.psk") == "secretpass"
+    assert "bssid" not in cmd            # BSSID не используется вовсе
+    assert _arg_after(cmd, "connection.autoconnect") == "no"
 
 
-def test_write_conf_wpa3_sae():
-    text = _conf_text({"ssid": "MyNet", "psk": "secretpass"}, "wpa3-sae")
-    assert "key_mgmt=SAE" in text
-    assert "ieee80211w=2" in text
+def test_nmcli_add_cmd_wpa3_sae():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "MyNet", "psk": "secretpass"}, "wpa3-sae")
+    assert _arg_after(cmd, "wifi-sec.key-mgmt") == "sae"
+    assert _arg_after(cmd, "wifi-sec.psk") == "secretpass"
 
 
-def test_write_conf_open_has_no_psk():
-    text = _conf_text({"ssid": "FreeWifi"}, "open")
-    assert "key_mgmt=NONE" in text
-    assert "psk=" not in text
+def test_nmcli_add_cmd_open_has_no_security_args():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "FreeWifi"}, "open")
+    assert "wifi-sec.key-mgmt" not in cmd
+    assert "wifi-sec.psk" not in cmd
 
 
-def test_write_conf_psk_hash_preferred_over_psk():
+def test_nmcli_add_cmd_wep():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "OldNet", "psk": "abcde"}, "wep")
+    assert _arg_after(cmd, "wifi-sec.key-mgmt") == "none"
+    assert _arg_after(cmd, "wifi-sec.wep-key0") == "abcde"
+
+
+def test_nmcli_add_cmd_psk_hash_preferred_over_psk():
     ap = {"ssid": "MyNet", "psk": "plain", "psk_hash": "abcdef0123456789"}
-    text = _conf_text(ap, "wpa2-psk")
-    assert "psk=abcdef0123456789" in text   # хеш без кавычек
-    assert 'psk="plain"' not in text
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", ap, "wpa2-psk")
+    assert _arg_after(cmd, "wifi-sec.psk") == "abcdef0123456789"
+
+
+def test_nmcli_add_cmd_hidden_flag():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "Hidden", "hidden": True}, "wpa2-psk")
+    assert _arg_after(cmd, "802-11-wireless.hidden") == "yes"
+
+
+def test_nmcli_add_cmd_not_hidden_by_default():
+    cmd = _build_nmcli_add_cmd("con1", "wlan1", {"ssid": "Visible"}, "wpa2-psk")
+    assert "802-11-wireless.hidden" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# classify_nm_failure — причины NetworkManager → no_dhcp / no_assoc
+# ---------------------------------------------------------------------------
+
+def test_classify_dhcp_related_reasons():
+    for reason in (
+        "ip-config-unavailable", "ip-config-expired",
+        "dhcp-start-failed", "dhcp-error", "dhcp-failed",
+        "IP_CONFIG_UNAVAILABLE",  # регистр/подчёркивания не важны
+    ):
+        assert classify_nm_failure(reason) == "no_dhcp", reason
+
+
+def test_classify_assoc_related_reasons_default_to_no_assoc():
+    for reason in ("no-secrets", "supplicant-disconnect", "supplicant-timeout", "config-failed"):
+        assert classify_nm_failure(reason) == "no_assoc", reason
+
+
+def test_classify_unknown_reason_defaults_to_no_assoc():
+    assert classify_nm_failure("something-completely-unrecognized") == "no_assoc"
+    assert classify_nm_failure(None) == "no_assoc"
+    assert classify_nm_failure("") == "no_assoc"
 
 
 # ---------------------------------------------------------------------------
