@@ -14,13 +14,9 @@ defaults:
   dhcp_timeout_s: 30
 
 access_points:
-  - id: "ap-garage-01"          # человекочитаемый идентификатор
-    ssid: "MyNet_Garage"        # имя сети (обязательно)
-    psk: "<пароль>"             # пароль в открытом виде ЛИБО psk_hash ниже
-    # psk_hash: "5f3c..."       # 64-симв. PSK из wpa_passphrase (предпочтительно)
+  - id: "ap-01"          # человекочитаемый идентификатор
+    ssid: "123"        # имя сети (обязательно)
+    psk: "11112222"             # пароль в открытом виде ЛИБО psk_hash ниже
     # security: "wpa2-psk"      # опц.: open | wpa-psk | wpa2-psk | wpa3-sae | wpa2-eap
     # hidden: false             # опц.: скрытая сеть (SSID не вещается)
-    expected_lat: 47.2225       # опц.: координаты установки («должна быть здесь»)
-    expected_lon: 39.7188
     enabled: true
-    notes: "гараж, северный въезд"
