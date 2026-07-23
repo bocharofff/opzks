@@ -693,6 +693,9 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
     conn_mon.close()
     conn_ap.close()
 
+    logger.info("Формирование отчета по собранным данным...")
+    _print_scan_results(config["db_path"])
+
 
 # ===========================================================================
 # Экспорт (раздел 13 ТЗ)
