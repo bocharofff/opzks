@@ -61,6 +61,61 @@ def _read_csv(path):
         return list(csv.reader(fh))
 
 
+NET_C = {
+    "bssid": "AA:BB:CC:DD:EE:03", "ssid": "NetC", "encryption": "WPA2-PSK",
+    "manufacturer": "Alfa", "channel": 1, "frequency": 2412.0,
+}
+
+DAY1 = "2026-07-20"
+DAY2 = "2026-07-23"
+
+
+def _seed_multi_day(conn):
+    """Данные за два разных дня — для тестов --since/--until.
+
+    День 1 (2026-07-20): NetA (2 набл.), NetC (1 набл., ТОЛЬКО в этот день).
+    День 2 (2026-07-23): NetA (1 набл., др. координаты), NetB (1 набл.).
+    ap_health: по одной записи на каждый день.
+    """
+    upsert_network(conn, NET_A)
+    upsert_network(conn, NET_B)
+    upsert_network(conn, NET_C)
+
+    # День 1
+    insert_observation(conn, {
+        "bssid": NET_A["bssid"], "timestamp": DAY1 + "T10:00:00Z",
+        "lat": 10.0, "lon": 20.0, "rssi": -50, "channel": 6, "frequency": 2437.0,
+    })
+    insert_observation(conn, {
+        "bssid": NET_A["bssid"], "timestamp": DAY1 + "T10:00:05Z",
+        "lat": 10.1, "lon": 20.1, "rssi": -55, "channel": 6, "frequency": 2437.0,
+    })
+    insert_observation(conn, {
+        "bssid": NET_C["bssid"], "timestamp": DAY1 + "T11:00:00Z",
+        "lat": 11.0, "lon": 21.0, "rssi": -40, "channel": 1, "frequency": 2412.0,
+    })
+    insert_ap_health(conn, {
+        "ap_id": "ap-1", "timestamp": DAY1 + "T10:00:00Z",
+        "status": "ok", "rtt_ms": 10.0, "lat": 10.0, "lon": 20.0,
+    })
+
+    # День 2
+    insert_observation(conn, {
+        "bssid": NET_A["bssid"], "timestamp": DAY2 + "T09:00:00Z",
+        "lat": 30.0, "lon": 40.0, "rssi": -60, "channel": 6, "frequency": 2437.0,
+    })
+    insert_observation(conn, {
+        "bssid": NET_B["bssid"], "timestamp": DAY2 + "T09:30:00Z",
+        "lat": 31.0, "lon": 41.0, "rssi": -65, "channel": 11, "frequency": 2462.0,
+    })
+    insert_ap_health(conn, {
+        "ap_id": "ap-1", "timestamp": DAY2 + "T09:00:00Z",
+        "status": "no_inet", "rtt_ms": None, "lat": 30.0, "lon": 40.0,
+    })
+
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # heatmap (одиночный CSV)
 # ---------------------------------------------------------------------------
@@ -315,3 +370,148 @@ def test_sanitize_filename_helper():
     assert exporter._sanitize_filename("MyNet Garage:01") == "MyNet_Garage_01"
     assert exporter._sanitize_filename("") == "hidden"
     assert exporter._sanitize_filename(None) == "hidden"
+
+
+# ---------------------------------------------------------------------------
+# normalize_time_bound — разбор --since/--until
+# ---------------------------------------------------------------------------
+
+def test_normalize_time_bound_date_only_start_of_day():
+    assert exporter.normalize_time_bound("2026-07-23") == "2026-07-23T00:00:00Z"
+
+
+def test_normalize_time_bound_date_only_end_of_day():
+    assert exporter.normalize_time_bound("2026-07-23", end_of_day=True) == "2026-07-23T23:59:59Z"
+
+
+def test_normalize_time_bound_full_datetime_passthrough():
+    assert exporter.normalize_time_bound("2026-07-23T14:30:00") == "2026-07-23T14:30:00Z"
+    assert exporter.normalize_time_bound("2026-07-23T14:30:00Z") == "2026-07-23T14:30:00Z"
+
+
+def test_normalize_time_bound_none_and_empty():
+    assert exporter.normalize_time_bound(None) is None
+    assert exporter.normalize_time_bound("") is None
+
+
+def test_normalize_time_bound_invalid_raises():
+    with pytest.raises(ValueError):
+        exporter.normalize_time_bound("не дата")
+    with pytest.raises(ValueError):
+        exporter.normalize_time_bound("23.07.2026")
+
+
+# ---------------------------------------------------------------------------
+# since/until — сужение экспорта до конкретного дня (все профили)
+# ---------------------------------------------------------------------------
+
+def _day_bounds(day):
+    return exporter.normalize_time_bound(day), exporter.normalize_time_bound(day, end_of_day=True)
+
+
+def test_heatmap_csv_since_until_selects_single_day(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out = str(tmp_path / "heatmap_day2.csv")
+    count = exporter.export_heatmap_csv(conn, out, since=since, until=until)
+
+    assert count == 2  # NetA (день2) + NetB (день2); NetC (только день1) исключён
+    rows = _read_csv(out)
+    bssids = {r[3] for r in rows[1:]}
+    assert bssids == {NET_A["bssid"], NET_B["bssid"]}
+
+
+def test_heatmap_csv_since_until_combined_with_bssid_filter(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY1)
+    out = str(tmp_path / "heatmap_a_day1.csv")
+    count = exporter.export_heatmap_csv(
+        conn, out, bssid_filter=NET_A["bssid"], since=since, until=until,
+    )
+    assert count == 2  # оба наблюдения NetA за день1; NetC отфильтрован по bssid
+
+
+def test_heatmap_per_network_since_until(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out_dir = str(tmp_path / "heatmap_nets_day2")
+    result = exporter.export_heatmap_per_network(conn, out_dir, since=since, until=until)
+
+    assert result == {"networks": 2, "samples": 2}  # NetC (день1) не входит
+    manifest = _read_csv(os.path.join(out_dir, "_manifest.csv"))
+    manifest_bssids = {row[0] for row in manifest[1:]}
+    assert manifest_bssids == {NET_A["bssid"], NET_B["bssid"]}
+
+
+def test_full_dataset_csv_since_until(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY1)
+    out = str(tmp_path / "full_day1.csv")
+    count = exporter.export_full_dataset_csv(conn, out, since=since, until=until)
+    assert count == 3  # 2×NetA + 1×NetC за день1; день2 исключён
+
+
+def test_full_dataset_gpkg_since_until(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out = str(tmp_path / "full_day2.gpkg")
+    count = exporter.export_full_dataset_gpkg(conn, out, since=since, until=until)
+    assert count == 2  # NetA + NetB за день2
+
+
+def test_full_dataset_since_until_both_files(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out_base = str(tmp_path / "full_day2_both")
+    result = exporter.export_full_dataset(conn, out_base, since=since, until=until)
+    assert result == {"gpkg": 2, "csv": 2}
+
+
+def test_ap_status_csv_since_until(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out = str(tmp_path / "ap_status_day2.csv")
+    count = exporter.export_ap_status_csv(conn, out, since=since, until=until)
+
+    assert count == 1
+    rows = _read_csv(out)
+    assert rows[1][2] == "no_inet"  # запись именно за день2
+
+
+def test_wigle_csv_since_until_excludes_network_outside_window(conn, tmp_path):
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out = str(tmp_path / "wigle_day2.csv")
+    count = exporter.export_wigle_csv(conn, out, since=since, until=until)
+
+    rows = _read_csv(out)
+    macs = {r[0] for r in rows[2:]}
+    # NetC наблюдалась только в день1 — в окне дня2 её не должно быть вовсе
+    assert NET_C["bssid"] not in macs
+    assert macs == {NET_A["bssid"], NET_B["bssid"]}
+    assert count == 2
+
+
+def test_wigle_csv_since_until_uses_observation_within_window(conn, tmp_path):
+    # Без окна "первое наблюдение" NetA было бы за день1 (lat=10.0);
+    # с окном дня2 должно подставиться наблюдение ИЗ этого окна (lat=30.0).
+    _seed_multi_day(conn)
+    since, until = _day_bounds(DAY2)
+    out = str(tmp_path / "wigle_day2_coords.csv")
+    exporter.export_wigle_csv(conn, out, since=since, until=until)
+
+    rows = _read_csv(out)
+    row_a = next(r for r in rows[2:] if r[0] == NET_A["bssid"])
+    assert float(row_a[6]) == pytest.approx(30.0)  # CurrentLatitude — из дня2, не дня1
+
+
+def test_wigle_csv_without_range_includes_all_networks_left_join(conn, tmp_path):
+    # Без --since/--until поведение НЕ меняется: все сети (в т.ч. NetC), LEFT JOIN.
+    _seed_multi_day(conn)
+    out = str(tmp_path / "wigle_all.csv")
+    count = exporter.export_wigle_csv(conn, out)
+
+    rows = _read_csv(out)
+    macs = {r[0] for r in rows[2:]}
+    assert macs == {NET_A["bssid"], NET_B["bssid"], NET_C["bssid"]}
+    assert count == 3

@@ -95,6 +95,60 @@ def _wigle_time(iso_ts):
         return iso_ts
 
 
+def normalize_time_bound(value, end_of_day=False):
+    """Приводит пользовательское значение даты/времени к нашему ISO8601 UTC.
+
+    Используется флагами ``--since``/``--until`` (в cli.py — ``--export-since``/
+    ``--export-until``) для выборки записей за конкретный период — например,
+    когда в одну БД пишется много данных и нужно выделить из неё один день.
+
+    Принимает:
+      - ``YYYY-MM-DD`` — только дата. Для нижней границы (``end_of_day=False``)
+        подставляется начало дня ``00:00:00``, для верхней (``end_of_day=True``)
+        — конец дня ``23:59:59``. Поэтому ``--since 2026-07-23 --until
+        2026-07-23`` захватывает ВЕСЬ этот день целиком (обе границы включительно).
+      - ``YYYY-MM-DDTHH:MM:SS`` или ``YYYY-MM-DDTHH:MM:SSZ`` — точный момент,
+        используется как есть, без подстановки.
+
+    Момент считается заданным в UTC — как и все временные метки в проекте
+    (``observations.timestamp`` / ``ap_health.timestamp`` — строки вида
+    ``YYYY-MM-DDTHH:MM:SSZ``, сравнимые лексикографически).
+
+    Args:
+        value:      Строка от пользователя или ``None``.
+        end_of_day: Если задана только дата — взять конец дня (23:59:59)
+                    вместо начала (00:00:00). На полный datetime не влияет.
+
+    Returns:
+        Строка ``YYYY-MM-DDTHH:MM:SSZ`` или ``None`` (если ``value`` пусто/None).
+
+    Raises:
+        ValueError: если формат не распознан ни как дата, ни как datetime.
+    """
+    if not value:
+        return None
+    text = value.strip()
+
+    try:
+        d = datetime.strptime(text, "%Y-%m-%d")
+        time_part = "23:59:59" if end_of_day else "00:00:00"
+        return "{}T{}Z".format(d.strftime("%Y-%m-%d"), time_part)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "Не удалось разобрать дату/время {!r} — используйте YYYY-MM-DD или "
+        "YYYY-MM-DDTHH:MM:SS".format(value)
+    )
+
+
 def _wigle_authmode(encryption):
     """Строит поле ``AuthMode`` в скобочной нотации WigleWifi-1.4.
 
@@ -148,32 +202,41 @@ def resolve_bssid_by_ssid(conn, ssid):
     return None, candidates
 
 
-def export_heatmap_csv(conn, output_path, bssid_filter=None):
+def export_heatmap_csv(conn, output_path, bssid_filter=None, since=None, until=None):
     """
     Экспорт для тепловых карт в QGIS.
     Только наблюдения с GPS-координатами (has_gps = 1).
+    Опционально сужается по конкретной сети (``bssid_filter``) и/или периоду
+    времени (``since``/``until`` — ISO8601 UTC, обе границы включительно;
+    см. :func:`normalize_time_bound`) — полезно, когда в одну БД пишется много
+    данных за разные заезды и нужно выделить, например, один день.
     Возвращает количество строк.
     """
+    where = ["o.has_gps = 1"]
+    params = []
     if bssid_filter:
-        sql = """
-            SELECT o.lat, o.lon, o.rssi, o.bssid, n.ssid, o.timestamp
-            FROM observations o
-            JOIN networks n ON o.bssid = n.bssid
-            WHERE o.has_gps = 1
-              AND o.bssid = ?
-            ORDER BY o.timestamp
-        """
-        rows = conn.execute(sql, (bssid_filter,)).fetchall()
+        where.append("o.bssid = ?")
+        params.append(bssid_filter)
+    if since:
+        where.append("o.timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("o.timestamp <= ?")
+        params.append(until)
+
+    sql = """
+        SELECT o.lat, o.lon, o.rssi, o.bssid, n.ssid, o.timestamp
+        FROM observations o
+        JOIN networks n ON o.bssid = n.bssid
+        WHERE {}
+        ORDER BY o.timestamp
+    """.format(" AND ".join(where))
+    rows = conn.execute(sql, params).fetchall()
+
+    if bssid_filter:
         logger.info("Heatmap: фильтр по BSSID %s", bssid_filter)
-    else:
-        sql = """
-            SELECT o.lat, o.lon, o.rssi, o.bssid, n.ssid, o.timestamp
-            FROM observations o
-            JOIN networks n ON o.bssid = n.bssid
-            WHERE o.has_gps = 1
-            ORDER BY o.timestamp
-        """
-        rows = conn.execute(sql).fetchall()
+    if since or until:
+        logger.info("Heatmap: диапазон времени %s .. %s", since or "-inf", until or "+inf")
 
     header = ["lat", "lon", "rssi", "bssid", "ssid", "timestamp"]
     count = _write_csv(output_path, header, rows)
@@ -188,7 +251,7 @@ def export_heatmap_csv(conn, output_path, bssid_filter=None):
     return count
 
 
-def export_heatmap_per_network(conn, out_dir):
+def export_heatmap_per_network(conn, out_dir, since=None, until=None):
     """Тепловая карта ПО КАЖДОЙ СЕТИ: один CSV на BSSID + манифест.
 
     Каждая сеть уже имеет множество сэмплов ``(lat, lon, rssi)`` в разных
@@ -198,15 +261,32 @@ def export_heatmap_per_network(conn, out_dir):
     файл сразу готов к интерполяции (IDW) в QGIS без дополнительной фильтрации
     (раздел 14 ТЗ).
 
+    ``since``/``until`` (см. :func:`normalize_time_bound`) сужают и отбор
+    сетей, и содержимое каждого файла до заданного периода — полезно, когда
+    в одну БД пишется много данных за разные заезды и нужно выделить,
+    например, один день.
+
     Args:
         conn:    Соединение с БД.
         out_dir: Каталог для файлов сетей + ``_manifest.csv``.
+        since:   Нижняя граница времени наблюдений (ISO8601 UTC), включительно.
+        until:   Верхняя граница времени наблюдений (ISO8601 UTC), включительно.
 
     Returns:
         ``{"networks": <число сетей>, "samples": <суммарное число сэмплов>}``.
     """
+    where = ["has_gps = 1"]
+    params = []
+    if since:
+        where.append("timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("timestamp <= ?")
+        params.append(until)
+
     bssids = conn.execute(
-        "SELECT DISTINCT bssid FROM observations WHERE has_gps = 1"
+        "SELECT DISTINCT bssid FROM observations WHERE {}".format(" AND ".join(where)),
+        params,
     ).fetchall()
 
     os.makedirs(out_dir, exist_ok=True)
@@ -224,7 +304,7 @@ def export_heatmap_per_network(conn, out_dir):
             _sanitize_filename(ssid), _sanitize_filename(bssid)
         )
         out_path = os.path.join(out_dir, filename)
-        count = export_heatmap_csv(conn, out_path, bssid_filter=bssid)
+        count = export_heatmap_csv(conn, out_path, bssid_filter=bssid, since=since, until=until)
 
         manifest_rows.append([bssid, ssid or "", count, filename])
         total_samples += count
@@ -242,11 +322,24 @@ def export_heatmap_per_network(conn, out_dir):
     return {"networks": len(bssids), "samples": total_samples}
 
 
-def export_full_dataset_csv(conn, output_path):
+def export_full_dataset_csv(conn, output_path, since=None, until=None):
     """
     Полный датасет: все поля networks + observations (включая записи без GPS).
+    ``since``/``until`` (см. :func:`normalize_time_bound`) сужают выборку по
+    ``observations.timestamp`` — полезно, когда в одну БД пишется много
+    данных и нужно выделить, например, один день.
     Возвращает количество строк.
     """
+    where = []
+    params = []
+    if since:
+        where.append("o.timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("o.timestamp <= ?")
+        params.append(until)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
     sql = """
         SELECT n.bssid, n.ssid, n.encryption, n.manufacturer,
                n.channel, n.frequency, n.first_seen, n.last_seen,
@@ -259,9 +352,10 @@ def export_full_dataset_csv(conn, output_path):
                o.has_gps
         FROM observations o
         JOIN networks n ON o.bssid = n.bssid
+        {}
         ORDER BY o.timestamp
-    """
-    rows = conn.execute(sql).fetchall()
+    """.format(where_sql)
+    rows = conn.execute(sql, params).fetchall()
     header = [
         "bssid", "ssid", "encryption", "manufacturer",
         "channel", "frequency", "first_seen", "last_seen",
@@ -277,7 +371,7 @@ def export_full_dataset_csv(conn, output_path):
     return count
 
 
-def export_full_dataset_gpkg(conn, output_path):
+def export_full_dataset_gpkg(conn, output_path, since=None, until=None):
     """Полный датасет в формате GeoPackage (.gpkg) — пространственный слой точек.
 
     Раздел 13 ТЗ требует GeoPackage для полного датасета (готовый слой для QGIS,
@@ -287,14 +381,27 @@ def export_full_dataset_gpkg(conn, output_path):
     Включаются только наблюдения с координатами (``has_gps=1``) — геометрия
     точки без координат не имеет смысла; полная таблица (в т.ч. записи без
     GPS) доступна в CSV-варианте (:func:`export_full_dataset_csv`).
+    ``since``/``until`` (см. :func:`normalize_time_bound`) сужают выборку по
+    ``observations.timestamp``.
 
     Args:
         conn:        Соединение с БД.
         output_path: Путь к создаваемому ``.gpkg`` (перезаписывается, если существует).
+        since:       Нижняя граница времени наблюдений (ISO8601 UTC), включительно.
+        until:       Верхняя граница времени наблюдений (ISO8601 UTC), включительно.
 
     Returns:
         Количество вставленных точек.
     """
+    where = ["o.has_gps = 1"]
+    params = []
+    if since:
+        where.append("o.timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("o.timestamp <= ?")
+        params.append(until)
+
     sql = """
         SELECT n.bssid, n.ssid, n.encryption, n.manufacturer,
                n.channel, n.frequency, n.first_seen, n.last_seen,
@@ -306,10 +413,10 @@ def export_full_dataset_gpkg(conn, output_path):
                o.has_gps
         FROM observations o
         JOIN networks n ON o.bssid = n.bssid
-        WHERE o.has_gps = 1
+        WHERE {}
         ORDER BY o.timestamp
-    """
-    rows = conn.execute(sql).fetchall()
+    """.format(" AND ".join(where))
+    rows = conn.execute(sql, params).fetchall()
 
     # Абсолютный путь обязателен: pygeopkg.GeoPackage.create() сам проверяет
     # dirname(target_path) — для голого имени файла без каталога (напр. просто
@@ -369,42 +476,60 @@ def export_full_dataset_gpkg(conn, output_path):
     return count
 
 
-def export_full_dataset(conn, out_base):
+def export_full_dataset(conn, out_base, since=None, until=None):
     """Полный датасет — ОБА формата сразу (раздел 13 ТЗ: GeoPackage (.gpkg) / CSV).
 
     Args:
         conn:     Соединение с БД.
         out_base: Путь БЕЗ расширения; создаются ``out_base + ".gpkg"`` и
                   ``out_base + ".csv"``.
+        since:    Нижняя граница времени наблюдений (ISO8601 UTC), включительно.
+        until:    Верхняя граница времени наблюдений (ISO8601 UTC), включительно.
 
     Returns:
         ``{"gpkg": <точек>, "csv": <строк>}``.
     """
-    gpkg_count = export_full_dataset_gpkg(conn, out_base + ".gpkg")
-    csv_count = export_full_dataset_csv(conn, out_base + ".csv")
+    gpkg_count = export_full_dataset_gpkg(conn, out_base + ".gpkg", since=since, until=until)
+    csv_count = export_full_dataset_csv(conn, out_base + ".csv", since=since, until=until)
     return {"gpkg": gpkg_count, "csv": csv_count}
 
 
-def export_wigle_csv(conn, output_path):
+def export_wigle_csv(conn, output_path, since=None, until=None):
     """
     Экспорт в формате WigleWifi-1.4 (сверено с api.wigle.net/csvFormat-1_4.html).
-    Одна строка на сеть (первое наблюдение с GPS).
+    Одна строка на сеть (первое наблюдение с GPS, при заданном диапазоне —
+    первое наблюдение ИЗ этого диапазона; см. :func:`normalize_time_bound`).
+    Сеть, не наблюдавшаяся ни разу в заданном диапазоне, из выгрузки исключается
+    (без диапазона поведение как раньше — попадают все сети, LEFT JOIN).
     Возвращает количество строк данных (без заголовочных строк Wigle).
     """
-    # Первое наблюдение с GPS для каждой сети
+    time_where = []
+    params = []
+    if since:
+        time_where.append("timestamp >= ?")
+        params.append(since)
+    if until:
+        time_where.append("timestamp <= ?")
+        params.append(until)
+    time_sql = (" AND " + " AND ".join(time_where)) if time_where else ""
+    # Диапазон задан → JOIN (сеть без наблюдения в окне не попадает в выгрузку);
+    # без диапазона — LEFT JOIN, как раньше (попадают все сети из networks).
+    join_kind = "JOIN" if time_where else "LEFT JOIN"
+
+    # Первое наблюдение с GPS для каждой сети (в пределах диапазона, если задан)
     sql = """
         SELECT n.bssid, n.ssid, n.encryption, n.first_seen,
             o.channel, o.rssi, o.lat, o.lon
         FROM networks n
-        LEFT JOIN observations o ON o.id = (
+        {join_kind} observations o ON o.id = (
             SELECT id
             FROM observations
-            WHERE bssid = n.bssid AND has_gps = 1
+            WHERE bssid = n.bssid AND has_gps = 1{time_sql}
             ORDER BY id ASC
             LIMIT 1
         )
-    """
-    rows = conn.execute(sql).fetchall()
+    """.format(join_kind=join_kind, time_sql=time_sql)
+    rows = conn.execute(sql, params).fetchall()
 
     _ensure_dir(output_path)
     count = 0
@@ -455,18 +580,31 @@ def export_wigle_csv(conn, output_path):
     return count
 
 
-def export_ap_status_csv(conn, output_path):
+def export_ap_status_csv(conn, output_path, since=None, until=None):
     """
     Экспорт статусов проверок точек оператора.
     Только поля из ap_health — никаких паролей и конфигурации.
+    ``since``/``until`` (см. :func:`normalize_time_bound`) сужают выборку по
+    ``ap_health.timestamp``.
     Возвращает количество строк.
     """
+    where = []
+    params = []
+    if since:
+        where.append("timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("timestamp <= ?")
+        params.append(until)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
     sql = """
         SELECT ap_id, timestamp, status, rtt_ms, lat, lon
         FROM ap_health
+        {}
         ORDER BY timestamp
-    """
-    rows = conn.execute(sql).fetchall()
+    """.format(where_sql)
+    rows = conn.execute(sql, params).fetchall()
     header = ["ap_id", "timestamp", "status", "rtt", "lat", "lon"]
     count = _write_csv(output_path, header, rows)
 
@@ -519,6 +657,7 @@ if __name__ == "__main__":
   python -m src.exporter --profile heatmap --bssid AA:BB:CC:DD:EE:FF
   python -m src.exporter --profile heatmap_networks
   python -m src.exporter --profile full --db data/wifi_monitor.db
+  python -m src.exporter --profile full --since 2026-07-23 --until 2026-07-23
   python -m src.exporter --profile wigle
   python -m src.exporter --profile ap_status --out /tmp/report.csv
         """,
@@ -554,12 +693,29 @@ if __name__ == "__main__":
              "full (.gpkg/.csv добавятся сами), каталог для heatmap_networks "
              "(default: export/<профиль>_<timestamp>[.csv])",
     )
+    parser.add_argument(
+        "--since", metavar="<YYYY-MM-DD[THH:MM:SS]>",
+        help="нижняя граница времени наблюдений, включительно, UTC (для всех "
+             "профилей). Только дата = начало дня",
+    )
+    parser.add_argument(
+        "--until", metavar="<YYYY-MM-DD[THH:MM:SS]>",
+        help="верхняя граница времени наблюдений, включительно, UTC. Только дата "
+             "= конец дня — поэтому --since 2026-07-23 --until 2026-07-23 "
+             "выберет весь этот день целиком",
+    )
 
     args = parser.parse_args()
 
     # Валидация: --ssid/--bssid только для heatmap
     if (args.ssid or args.bssid) and args.profile != "heatmap":
         parser.error("--ssid/--bssid можно использовать только с --profile heatmap")
+
+    try:
+        since = normalize_time_bound(args.since, end_of_day=False)
+        until = normalize_time_bound(args.until, end_of_day=True)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Настройка логирования
     logging.basicConfig(
@@ -596,13 +752,13 @@ if __name__ == "__main__":
     try:
         if args.profile == "full":
             out_base = args.out or "export/full_{}".format(_ts())
-            result = export_full_dataset(conn, out_base)
+            result = export_full_dataset(conn, out_base, since=since, until=until)
             print("Экспортировано: {} точек → {}.gpkg, {} строк → {}.csv".format(
                 result["gpkg"], out_base, result["csv"], out_base,
             ))
         elif args.profile == "heatmap_networks":
             out_dir = args.out or "export/heatmap_networks_{}".format(_ts())
-            result = export_heatmap_per_network(conn, out_dir)
+            result = export_heatmap_per_network(conn, out_dir, since=since, until=until)
             print("Экспортировано: {} сетей, {} сэмплов → {}/".format(
                 result["networks"], result["samples"], out_dir,
             ))
@@ -613,9 +769,9 @@ if __name__ == "__main__":
             # heatmap принимает дополнительный аргумент bssid_filter (уже
             # разрешённый из --ssid выше либо взятый напрямую из --bssid)
             if args.profile == "heatmap":
-                count = fn(conn, out_path, bssid_filter=bssid_filter)
+                count = fn(conn, out_path, bssid_filter=bssid_filter, since=since, until=until)
             else:
-                count = fn(conn, out_path)
+                count = fn(conn, out_path, since=since, until=until)
 
             print("Экспортировано {} строк → {}".format(count, out_path))
 

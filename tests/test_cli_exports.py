@@ -111,3 +111,67 @@ def test_explicit_bssid_takes_priority_over_ssid(db_path, export_dir):
     out_path = _heatmap_csv_path(export_dir)
     rows = _read_csv(out_path)
     assert rows[1][3] == NET_B["bssid"]
+
+
+# ---------------------------------------------------------------------------
+# --export-since/--export-until — сужение экспорта до конкретного дня
+# ---------------------------------------------------------------------------
+
+DAY1 = "2026-07-20"
+DAY2 = "2026-07-23"
+
+
+@pytest.fixture
+def db_path_multi_day(tmp_path):
+    """Данные за два разных дня — NetA видна в оба, NetB только во второй."""
+    path = str(tmp_path / "wifi_monitor_multi.db")
+    conn = init_db(path)
+    upsert_network(conn, NET_A)
+    upsert_network(conn, NET_B)
+    insert_observation(conn, {
+        "bssid": NET_A["bssid"], "timestamp": DAY1 + "T10:00:00Z",
+        "lat": 10.0, "lon": 20.0, "rssi": -50, "channel": 6, "frequency": 2437.0,
+    })
+    insert_observation(conn, {
+        "bssid": NET_A["bssid"], "timestamp": DAY2 + "T09:00:00Z",
+        "lat": 30.0, "lon": 40.0, "rssi": -60, "channel": 6, "frequency": 2437.0,
+    })
+    insert_observation(conn, {
+        "bssid": NET_B["bssid"], "timestamp": DAY2 + "T09:30:00Z",
+        "lat": 31.0, "lon": 41.0, "rssi": -65, "channel": 11, "frequency": 2462.0,
+    })
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_do_exports_since_until_narrows_heatmap_to_one_day(db_path_multi_day, export_dir):
+    from src import exporter
+    since = exporter.normalize_time_bound(DAY2)
+    until = exporter.normalize_time_bound(DAY2, end_of_day=True)
+
+    cli.do_exports(
+        db_path_multi_day, ["heatmap"], bssid_filter=None, ssid_filter=None,
+        since=since, until=until,
+    )
+
+    out_path = _heatmap_csv_path(export_dir)
+    rows = _read_csv(out_path)
+    assert len(rows) - 1 == 2  # NetA (день2) + NetB; NetA-день1 исключён
+    bssids = {r[3] for r in rows[1:]}
+    assert bssids == {NET_A["bssid"], NET_B["bssid"]}
+
+
+def test_do_exports_without_range_includes_all_days(db_path_multi_day, export_dir):
+    cli.do_exports(db_path_multi_day, ["heatmap"], bssid_filter=None, ssid_filter=None)
+
+    out_path = _heatmap_csv_path(export_dir)
+    rows = _read_csv(out_path)
+    assert len(rows) - 1 == 3  # все наблюдения обоих дней
+
+
+def test_main_rejects_invalid_export_since_before_running_mode():
+    # Некорректная дата должна отсекаться ДО сканирования адаптеров/режима —
+    # exit code 2 (как и другие ошибки валидации аргументов в main()).
+    rc = cli.main(["--list", "--export-since", "not-a-date"])
+    assert rc == 2

@@ -701,7 +701,7 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
 # Экспорт (раздел 13 ТЗ)
 # ===========================================================================
 
-def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
+def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, until=None):
     """Выгружает указанные профили экспорта (раздел 13 ТЗ) и печатает сводную таблицу.
 
     ``full`` создаёт ОБА файла (.gpkg + .csv); ``heatmap_networks`` пишет
@@ -714,6 +714,10 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
     (коллизия — частое дело для дефолтных SSID вроде «Keenetic-1234»), экспорт
     этого профиля прерывается с понятной ошибкой и списком MAC-кандидатов —
     тогда уточнить нужно уже через ``--export-bssid``.
+
+    ``since``/``until`` (уже разрешённые через :func:`exporter.normalize_time_bound`,
+    ISO8601 UTC) сужают ВСЕ профили до заданного периода — полезно, когда в одну
+    БД пишется много данных за разные заезды и нужно выделить, например, один день.
     """
     if not os.path.exists(db_path):
         logger.error("База не найдена для экспорта: %s", db_path)
@@ -749,7 +753,7 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
             try:
                 if profile == "full":
                     out_base = os.path.join(EXPORT_DIR, "full_{}".format(ts))
-                    result = exporter.export_full_dataset(conn, out_base)
+                    result = exporter.export_full_dataset(conn, out_base, since=since, until=until)
                     logger.info(
                         "Экспорт «full»: %d точек (.gpkg), %d строк (.csv) → %s.*",
                         result["gpkg"], result["csv"], out_base,
@@ -759,7 +763,7 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
 
                 elif profile == "heatmap_networks":
                     out_dir = os.path.join(EXPORT_DIR, "heatmap_networks_{}".format(ts))
-                    result = exporter.export_heatmap_per_network(conn, out_dir)
+                    result = exporter.export_heatmap_per_network(conn, out_dir, since=since, until=until)
                     logger.info(
                         "Экспорт «heatmap_networks»: %d сетей, %d сэмплов → %s%s",
                         result["networks"], result["samples"], out_dir, os.sep,
@@ -772,19 +776,21 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None):
 
                 elif profile == "heatmap":
                     out_path = os.path.join(EXPORT_DIR, "heatmap_{}.csv".format(ts))
-                    count = exporter.export_heatmap_csv(conn, out_path, bssid_filter=bssid_filter)
+                    count = exporter.export_heatmap_csv(
+                        conn, out_path, bssid_filter=bssid_filter, since=since, until=until,
+                    )
                     logger.info("Экспорт «heatmap»: %d строк → %s", count, out_path)
                     summary.append(("heatmap", "{} строк".format(count), out_path))
 
                 elif profile == "wigle":
                     out_path = os.path.join(EXPORT_DIR, "wigle_{}.csv".format(ts))
-                    count = exporter.export_wigle_csv(conn, out_path)
+                    count = exporter.export_wigle_csv(conn, out_path, since=since, until=until)
                     logger.info("Экспорт «wigle»: %d строк → %s", count, out_path)
                     summary.append(("wigle", "{} строк".format(count), out_path))
 
                 elif profile == "ap_status":
                     out_path = os.path.join(EXPORT_DIR, "ap_status_{}.csv".format(ts))
-                    count = exporter.export_ap_status_csv(conn, out_path)
+                    count = exporter.export_ap_status_csv(conn, out_path, since=since, until=until)
                     logger.info("Экспорт «ap_status»: %d строк → %s", count, out_path)
                     summary.append(("ap_status", "{} строк".format(count), out_path))
 
@@ -831,12 +837,19 @@ def build_parser() -> argparse.ArgumentParser:
   wigle             формат WigleWifi-1.4 (сверка/загрузка на wigle.net)
   ap_status         результаты проверки точек оператора
 
+--export-since/--export-until: сузить экспорт ЛЮБОГО профиля до периода
+  времени (включительно, UTC) — если в одну БД пишется много данных за
+  разные заезды и нужно выделить, например, один день. Только дата = начало/
+  конец дня — --export-since 2026-07-23 --export-until 2026-07-23 выберет
+  весь этот день целиком.
+
 примеры:
   sudo python -m src.cli --list
   sudo python -m src.cli                # интерактивное меню
   sudo python -m src.cli --mode 1 --monitor AA:BB:CC:DD:EE:FF --duration 600 --export heatmap_networks wigle
   sudo python -m src.cli --mode 2 --client wlan1 --export ap_status
   sudo python -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 --duration 1800 --export full
+  sudo python -m src.cli --mode 1 --export full --export-since 2026-07-23 --export-until 2026-07-23
 """,
     )
 
@@ -875,6 +888,13 @@ def build_parser() -> argparse.ArgumentParser:
     export_net_group.add_argument("--export-bssid", dest="export_bssid", metavar="AA:BB:CC:DD:EE:FF",
                         help="фильтр по MAC для профиля heatmap (только для разрешения "
                              "коллизии одинаковых имён сетей)")
+    parser.add_argument("--export-since", dest="export_since", metavar="<YYYY-MM-DD[THH:MM:SS]>",
+                        help="нижняя граница времени наблюдений для экспорта, включительно, "
+                             "UTC (для всех профилей). Только дата = начало дня")
+    parser.add_argument("--export-until", dest="export_until", metavar="<YYYY-MM-DD[THH:MM:SS]>",
+                        help="верхняя граница времени наблюдений для экспорта, включительно, "
+                             "UTC. Только дата = конец дня — --export-since 2026-07-23 "
+                             "--export-until 2026-07-23 выберет весь этот день целиком")
 
     return parser
 
@@ -895,6 +915,15 @@ def main(argv=None) -> int:
     setup_logging(config)
 
     logger.info("=== wifi-monitor — оркестратор ===")
+
+    # Валидируем диапазон экспорта СРАЗУ (до запуска режима) — опечатка в дате
+    # не должна обнаружиться только после часов мониторинга, на самом экспорте.
+    try:
+        export_since = exporter.normalize_time_bound(args.export_since, end_of_day=False)
+        export_until = exporter.normalize_time_bound(args.export_until, end_of_day=True)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 2
 
     adapters = adapters_mod.list_wifi_adapters()
 
@@ -948,7 +977,10 @@ def main(argv=None) -> int:
 
         # Экспорт профилей после отработки режима (раздел 13 ТЗ, --export)
         if args.export:
-            do_exports(config["db_path"], args.export, args.export_bssid, args.export_ssid)
+            do_exports(
+                config["db_path"], args.export, args.export_bssid, args.export_ssid,
+                since=export_since, until=export_until,
+            )
 
     finally:
         if gps is not None:
