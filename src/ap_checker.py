@@ -418,10 +418,10 @@ class APChecker:
                 # Различаем "не ассоциировались" и "ассоциировались, но нет DHCP"
                 _, link_out, _ = _run(["iw", "dev", self.iface, "link"], timeout=5)
                 if "Connected" in link_out:
-                    logger.info("[%s] Ассоциация есть, но IP не получен", ap_id)
+                    logger.debug("[%s] Ассоциация есть, но IP не получен", ap_id)
                     status = "no_dhcp"
                 else:
-                    logger.info("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
+                    logger.debug("[%s] Нет ассоциации за %d сек", ap_id, dhcp_timeout_s)
                     status = "no_assoc"
                 return status, rtt_ms
 
@@ -452,7 +452,7 @@ class APChecker:
 
             if not dns_ready:
                 _, resolv, _ = _run(["cat", "/etc/resolv.conf"], timeout=5)
-                logger.info(
+                logger.debug(
                     "[%s] DNS не резолвит за 25с. resolv.conf:\n%s",
                     ap_id, resolv.strip(),
                 )
@@ -474,7 +474,7 @@ class APChecker:
                     status = "ok"
                 else:
                     # Редирект или captive portal — интернет есть, но перехватывается
-                    logger.info(
+                    logger.debug(
                         "[%s] Captive portal или неожиданный код: %d",
                         ap_id, resp.status_code,
                     )
@@ -483,7 +483,7 @@ class APChecker:
                 rtt_ms = (time.monotonic() - t0) * 1000
                 status = "timeout"
             except requests.exceptions.RequestException as exc:
-                logger.info("[%s] HTTP-запрос завершился ошибкой: %s", ap_id, exc)
+                logger.debug("[%s] HTTP-запрос завершился ошибкой: %s", ap_id, exc)
                 status = "no_inet"
 
         except Exception as exc:

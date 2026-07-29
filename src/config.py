@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from rich.logging import RichHandler
+
+from src.ui import console as _console
 
 # ---------------------------------------------------------------------------
 # Встроенные значения по умолчанию (зеркалируют config/settings.yaml)
@@ -25,6 +28,10 @@ _DEFAULTS: dict[str, Any] = {
     "sync_interval_sec": 30,
     "log_level":         "INFO",
     "log_file":          "data/wifi_monitor.log",
+    # Обычный режим (по умолчанию): консоль показывает только майлстоуны, итоги
+    # проверки точек и warnings/errors (уровень — log_level). Файл всегда пишет
+    # полный DEBUG. debug=true (или флаг --debug) поднимает консоль до DEBUG.
+    "debug":             False,
     # Тепловая карта: даунсэмплинг сэмплов сигнала (1 сэмпл на N секунд на сеть)
     "heatmap_sample_sec": 1,
     # Проверка точек «по присутствию» (разделы плана про режимы 2/3)
@@ -85,22 +92,41 @@ def load_config(path: str = "config/settings.yaml") -> dict:
     return merged
 
 
+#: Логгеры сторонних библиотек, которые в DEBUG сыплют посторонним шумом
+#: (HTTP-детали соединений и т.п.) — приглушаем их отдельно от нашего кода.
+_NOISY_THIRD_PARTY = ("urllib3", "requests", "gpsd")
+
+
 def setup_logging(config: dict) -> None:
-    """Настраивает корневой логгер приложения.
+    """Настраивает корневой логгер приложения в двух режимах: обычном и debug.
 
-    Создаёт два handler'а:
-    * ``StreamHandler`` — вывод в консоль (stderr);
-    * ``FileHandler``   — запись в файл из ``config['log_file']``.
+    Создаёт два handler'а с РАЗНЫМИ уровнями (root всегда ``DEBUG``, чтобы оба
+    handler'а получали все записи, а фильтрация — на уровне handler'а):
 
-    Уровень логирования берётся из ``config['log_level']`` (строка вида
-    ``"INFO"``, ``"DEBUG"`` и т.д.); при некорректном значении используется
-    ``INFO``.  Родительская директория для лог-файла создаётся автоматически.
+    * ``RichHandler`` (консоль, использует общий ``src.ui.console`` — тот же
+      Console, которым таблицы/спиннеры пользуются в cli.py, чтобы вывод не
+      «дрался» за stdout) — уровень зависит от режима:
+        - обычный режим (``config['debug']`` не задан/``False``) — уровень из
+          ``config['log_level']`` (по умолчанию ``INFO``): только майлстоуны,
+          итоги проверки точек, warnings и errors;
+        - debug-режим (``config['debug'] = True``, обычно через флаг ``--debug``)
+          — уровень ``DEBUG``: полная детальность (пер-цикловые синхронизации,
+          промежуточные шаги проверки точек и т.д.).
+    * ``FileHandler`` (``config['log_file']``) — ВСЕГДА ``DEBUG``, независимо от
+      режима консоли, обычным (не-rich) форматтером: полный журнал доступен для
+      разбора инцидентов постфактум без перезапуска в debug-режиме.
+
+    Дополнительно приглушает известные болтливые сторонние логгеры (см.
+    :data:`_NOISY_THIRD_PARTY`) до ``WARNING`` — иначе их DEBUG заливает и
+    debug-консоль, и (всегда подробный) файл.
 
     Args:
-        config: Словарь настроек, возвращённый :func:`load_config`.
+        config: Словарь настроек, возвращённый :func:`load_config`. Ключи:
+            ``log_level``, ``log_file``, ``debug``.
     """
     log_file: str = config.get("log_file", _DEFAULTS["log_file"])
     log_level_str: str = str(config.get("log_level", _DEFAULTS["log_level"])).upper()
+    debug: bool = bool(config.get("debug", _DEFAULTS["debug"]))
 
     numeric_level = getattr(logging, log_level_str, None)
     if not isinstance(numeric_level, int):
@@ -110,27 +136,45 @@ def setup_logging(config: dict) -> None:
             "используется INFO."
         )
 
+    console_level = logging.DEBUG if debug else numeric_level
+
     # Создаём директорию для лог-файла если не существует
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # RichHandler сам рисует время/уровень своей колонкой — форматтеру оставляем
+    # только имя логгера и сообщение, иначе они задвоятся.
+    console_handler = RichHandler(
+        console=_console,
+        show_path=False,
+        rich_tracebacks=True,
+        log_time_format="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    console_handler.setLevel(console_level)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-
+    file_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(fmt)
+    file_handler.setFormatter(file_fmt)
+    file_handler.setLevel(logging.DEBUG)
 
     root = logging.getLogger()
     # Избегаем дублирования handler'ов при повторном вызове
     if root.handlers:
         root.handlers.clear()
 
-    root.setLevel(numeric_level)
-    root.addHandler(stream_handler)
+    # root — DEBUG, чтобы ничего не отсекалось до handler'ов; реальная
+    # фильтрация консоли/файла — через уровни самих handler'ов выше.
+    root.setLevel(logging.DEBUG)
+    root.addHandler(console_handler)
     root.addHandler(file_handler)
 
-    logger.debug("Логирование настроено: level=%s, file=%s", log_level_str, log_file)
+    for name in _NOISY_THIRD_PARTY:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    logger.debug(
+        "Логирование настроено: debug=%s, консоль=%s, файл=%s (DEBUG)",
+        debug, logging.getLevelName(console_level), log_file,
+    )
 
 
 def validate_targets_permissions(path: str) -> bool:

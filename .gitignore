@@ -12,11 +12,14 @@ data/*.db
 
 
 export/*.csv
+export/*.gpkg
+export/heatmap_networks_*/
 
 # Если в корне случайно появятся файлы дампов или логов
 *.log
 *.kismet
 *.wiglecsv
+*.gpkg
 
 # Исключение для .gitkeep, чтобы пустая папка data оставалась в Git
 !data/.gitkeep

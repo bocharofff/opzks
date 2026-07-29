@@ -23,5 +23,9 @@ min_signal_dbm: null       # опц. порог dBm: слабее — не пр�
 default_security: wpa2-psk # запасной тип шифрования, если не задан и не выведен из эфира
 
 # Логирование
+# log_level — уровень КОНСОЛИ в обычном режиме (майлстоуны, итоги проверки точек,
+# warnings/errors). Файл (log_file) пишет полный DEBUG всегда, независимо от режима.
+# debug: true (или флаг --debug) поднимает уровень консоли до DEBUG.
 log_level: INFO
 log_file: data/wifi_monitor.log
+debug: false
