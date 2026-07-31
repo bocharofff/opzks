@@ -701,7 +701,8 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
 # Экспорт (раздел 13 ТЗ)
 # ===========================================================================
 
-def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, until=None):
+def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, until=None,
+               map_params=None):
     """Выгружает указанные профили экспорта (раздел 13 ТЗ) и печатает сводную таблицу.
 
     ``full`` создаёт ОБА файла (.gpkg + .csv); ``heatmap_networks`` пишет
@@ -718,6 +719,9 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
     ``since``/``until`` (уже разрешённые через :func:`exporter.normalize_time_bound`,
     ISO8601 UTC) сужают ВСЕ профили до заданного периода — полезно, когда в одну
     БД пишется много данных за разные заезды и нужно выделить, например, один день.
+
+    ``map_params`` — секция ``map`` из settings.yaml (тюнинг HTML-карты: шаг сетки,
+    IDW, шкала цветов и т.п.); отдельных CLI-флагов у неё нет.
     """
     if not os.path.exists(db_path):
         logger.error("База не найдена для экспорта: %s", db_path)
@@ -782,6 +786,25 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
                     logger.info("Экспорт «heatmap»: %d строк → %s", count, out_path)
                     summary.append(("heatmap", "{} строк".format(count), out_path))
 
+                elif profile == "map":
+                    out_path = os.path.join(EXPORT_DIR, "map_{}.html".format(ts))
+                    # Интерполяция + рендер тяжелее остальных профилей (секунды-минуты
+                    # на больших наборах) — показываем спиннер, чтобы не выглядело зависанием.
+                    with ui.spinner("Строим карту (интерполяция и рендер) ..."):
+                        result = exporter.export_map_html(
+                            conn, out_path, bssid_filter=bssid_filter,
+                            since=since, until=until, map_params=map_params,
+                        )
+                    logger.info(
+                        "Экспорт «map»: %d слоёв, %d замеров → %s",
+                        result["networks"], result["points"], out_path,
+                    )
+                    summary.append((
+                        "map",
+                        "{} слоёв, {} замеров".format(result["networks"], result["points"]),
+                        out_path,
+                    ))
+
                 elif profile == "wigle":
                     out_path = os.path.join(EXPORT_DIR, "wigle_{}.csv".format(ts))
                     count = exporter.export_wigle_csv(conn, out_path, since=since, until=until)
@@ -797,6 +820,10 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
                 else:
                     logger.warning("Неизвестный профиль экспорта: %s", profile)
 
+            except exporter.MapExportError as exc:
+                # Данных не хватило на карту — это не сбой, а объяснимая ситуация:
+                # показываем причину без трейсбека, остальные профили не трогаем.
+                logger.error("Экспорт «%s» не выполнен: %s", profile, exc)
             except Exception as exc:
                 logger.error("Ошибка экспорта «%s»: %s", profile, exc)
     finally:
@@ -836,6 +863,8 @@ def build_parser() -> argparse.ArgumentParser:
   full              полный датасет: создаются ОБА файла — GeoPackage (.gpkg) и CSV
   wigle             формат WigleWifi-1.4 (сверка/загрузка на wigle.net)
   ap_status         результаты проверки точек оператора
+  map               готовая интерактивная карта в HTML (открыть в браузере, QGIS не нужен):
+                    сети — переключаемые слои; тюнинг — секция map: в settings.yaml
 
 --export-since/--export-until: сузить экспорт ЛЮБОГО профиля до периода
   времени (включительно, UTC) — если в одну БД пишется много данных за
@@ -980,6 +1009,7 @@ def main(argv=None) -> int:
             do_exports(
                 config["db_path"], args.export, args.export_bssid, args.export_ssid,
                 since=export_since, until=export_until,
+                map_params=config.get("map"),
             )
 
     finally:

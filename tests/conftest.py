@@ -2,7 +2,7 @@
 tests/conftest.py — общие pytest-фикстуры для всего тест-сьюта wifi-monitor.
 
 Обнаруживается автоматически через механизм conftest-файлов pytest.
-Содержит фикстуры для test_db.py и test_adapters.py.
+Содержит фикстуры для test_db.py, test_adapters.py и тестов карты (test_map_*).
 """
 
 import pytest
@@ -25,6 +25,23 @@ def conn(tmp_path):
     connection = init_db(db_path)
     yield connection
     connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Фикстуры для тестов карты (src/wifi_heatmap, test_map_*.py)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def csv_path(tmp_path):
+    """Возвращает функцию, которая пишет строки данных во временный CSV и отдаёт путь к нему."""
+
+    def _make(rows: list[str], header: str = "lat,lon,rssi,bssid,ssid,timestamp") -> str:
+        path = tmp_path / "data.csv"
+        content = "\n".join([header, *rows]) + "\n"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    return _make
 
 
 # ---------------------------------------------------------------------------

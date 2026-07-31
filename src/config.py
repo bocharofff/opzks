@@ -40,6 +40,34 @@ _DEFAULTS: dict[str, Any] = {
     "scan_interval_sec": 8,      # пауза между сканами/циклами присутствия
     "min_signal_dbm": None,      # опц. порог: слишком слабые точки не проверять
     "default_security": "wpa2-psk",  # запасной тип шифрования, если не выведен из эфира
+    # Профиль экспорта "map" — интерактивная HTML-карта (src/wifi_heatmap).
+    # Тюнинг живёт только здесь (в CLI отдельных флагов нет): параметров ~20,
+    # они редко меняются от запуска к запуску. Значения — дефолты модуля.
+    "map": {
+        # Отбор сетей
+        "top": 10,                  # сколько сетей показать (по убыванию числа замеров)
+        "min_points": 20,           # минимум замеров, иначе слой не строится
+        # Интерполяция (IDW)
+        "grid_step_m": 3.0,         # шаг сетки, метры
+        "idw_power": 2.0,           # степень IDW
+        "idw_neighbors": 12,        # число ближайших соседей в расчёте
+        "idw_radius_m": None,       # радиус поиска соседей (null = без ограничения)
+        "max_distance_m": 10.0,     # полуширина зоны «есть данные», метры
+        "mask_mode": "track",       # track — коридор вдоль маршрута; points — буфер вокруг точек
+        "bridge_max_m": 40.0,       # макс. длина пути между детекциями для склейки коридора
+        "bridge_max_s": 30.0,       # макс. пауза между детекциями для склейки коридора
+        "cluster_eps_m": 100.0,     # порог пространственной кластеризации сети
+        "min_cluster_points": 3,    # минимум точек в кластере, иначе он считается шумом
+        "max_cells": 4_000_000,     # предел ячеек сетки на слой (иначе шаг огрубляется)
+        # Отрисовка
+        "rssi_min": -90.0,          # нижняя граница цветовой шкалы, дБм
+        "rssi_max": -30.0,          # верхняя граница цветовой шкалы, дБм
+        "rssi_auto": False,         # подгонять шкалу каждого слоя под факт. min/max сети
+        "opacity": 0.6,             # прозрачность тепловых слоёв, 0..1
+        "cmap": "RdYlGn",           # цветовая карта matplotlib
+        "reverse_cmap": True,       # true — красный сильный / зелёный слабый
+        "show_points": False,       # добавить слой фактических точек замеров
+    },
 }
 
 logger = logging.getLogger(__name__)
@@ -57,11 +85,15 @@ def load_config(path: str = "config/settings.yaml") -> dict:
     является корректным YAML — возвращает только дефолты, предварительно
     сообщив об этом через ``logging.warning``.
 
+    Секции-словари (напр. ``map``) сливаются ПОКЛЮЧЕВО: ChainMap подменяет
+    значение целиком, поэтому без отдельного слияния оператор, задавший в
+    settings.yaml один параметр карты, потерял бы все остальные её дефолты.
+
     Args:
         path: Путь к ``settings.yaml``. По умолчанию ``config/settings.yaml``.
 
     Returns:
-        Плоский ``dict`` с итоговыми настройками приложения.
+        ``dict`` с итоговыми настройками приложения.
     """
     file_values: dict[str, Any] = {}
 
@@ -89,6 +121,17 @@ def load_config(path: str = "config/settings.yaml") -> dict:
 
     # ChainMap: первый словарь — приоритетный
     merged = dict(ChainMap(file_values, _DEFAULTS))
+
+    # Слияние вложенных секций по ключам: задать в YAML один параметр карты
+    # и не потерять остальные дефолты.
+    for key, default_value in _DEFAULTS.items():
+        if isinstance(default_value, dict):
+            file_section = file_values.get(key)
+            section = dict(default_value)
+            if isinstance(file_section, dict):
+                section.update(file_section)
+            merged[key] = section
+
     return merged
 
 
