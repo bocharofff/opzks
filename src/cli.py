@@ -7,7 +7,7 @@ src/cli.py — оркестрация всего проекта wifi-monitor.
 проверку GPS-фикса, три режима работы, пассивный сбор через Kismet,
 проверку точек доступа оператора и экспорт данных.
 
-Режимы (раздел 6 ТЗ):
+Режимы работы:
     1 — Мониторинг               : 1 карта (monitor), Kismet + gpsd → база наблюдений
     2 — Проверка точек оператора : 1 карта (managed), обход точек, проверка интернета
     3 — Мониторинг + проверка    : 2 карты (monitor + managed), параллельно
@@ -52,13 +52,13 @@ from src import exporter
 
 logger = logging.getLogger(__name__)
 
-# Путь к кэшу выбранных ролей (раздел 7 ТЗ: «выбор может запоминаться»)
+# Путь к кэшу выбранных ролей: выбор карт запоминается между запусками
 ROLE_CACHE_PATH = "data/roles.json"
 # Каталог для CSV-экспорта
 EXPORT_DIR = "export"
 # Префикс журналов Kismet (совпадает с дефолтом kismet_runner)
 KISMET_TITLE = "scan_wifi"
-# Доступные профили экспорта (раздел 13 ТЗ) — источник истины в src.exporter
+# Доступные профили экспорта — источник истины в src.exporter
 EXPORT_PROFILES = exporter.EXPORT_PROFILES
 
 
@@ -148,7 +148,7 @@ def save_role_cache(roles: dict) -> None:
 
 
 # ===========================================================================
-# Выбор адаптеров и ролей (раздел 7 ТЗ)
+# Выбор адаптеров и ролей
 # ===========================================================================
 
 def resolve_adapter(identifier: str, adapters: list) -> dict:
@@ -206,7 +206,8 @@ def select_adapters(mode: int, args, adapters: list):
     """Назначает карты ролям монитор/клиент для выбранного режима.
 
     Источники выбора по приоритету: аргументы --monitor/--client → кэш ролей →
-    интерактивное меню. Привязка — по стабильному идентификатору (раздел 7 ТЗ).
+    интерактивное меню. Привязка — по стабильному идентификатору (MAC/USB-путь),
+    а не по имени wlanN: оно может меняться между загрузками.
 
     Возвращает кортеж (monitor_adapter|None, client_adapter|None).
     Бросает RuntimeError, если карту под обязательную роль выбрать не удалось.
@@ -274,7 +275,7 @@ def _prompt_mode(args):
 
 
 # ===========================================================================
-# Подсистема GPS (раздел 8 ТЗ)
+# Подсистема GPS
 # ===========================================================================
 
 def setup_gps(config: dict, use_gps: bool):
@@ -329,7 +330,8 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
     proc = None
 
     try:
-        # Раздел 7 ТЗ: монитор-карта выводится из-под NetworkManager
+        # Монитор-карта выводится из-под NetworkManager: иначе он будет
+        # мешать её переводу в monitor mode
         logger.info("Монитор-карта %s → unmanaged (NetworkManager)", orig_iface)
         ifmgr.set_unmanaged_networkmanager(orig_iface)
 
@@ -385,7 +387,7 @@ def monitor_collect(conn, gps, monitor_iface, channels, log_dir, title,
 
     except RuntimeError as exc:
         # Например, не удалось включить monitor mode или запустить Kismet —
-        # по разделу 7 ТЗ это не должно ронять процесс
+        # это не должно ронять процесс целиком
         logger.error("Мониторинг не запущен: %s", exc)
     except Exception as exc:
         logger.error("Непредвиденная ошибка в мониторинге: %s", exc)
@@ -621,7 +623,7 @@ def run_mode_2(config, client_ad, gps, stop_event, duration):
 def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channels):
     """Режим 3 — мониторинг и проверка точек параллельно на двух картах.
 
-    Раздел 7 ТЗ: NetworkManager не отключается полностью — только монитор-карта
+    NetworkManager не отключается полностью — только монитор-карта
     переводится в unmanaged (это делает monitor_collect), клиентская карта
     остаётся управляемой.
 
@@ -698,14 +700,14 @@ def run_mode_3(config, monitor_ad, client_ad, gps, stop_event, duration, channel
 
 
 # ===========================================================================
-# Экспорт (раздел 13 ТЗ)
+# Экспорт
 # ===========================================================================
 
 def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, until=None,
-               map_params=None):
-    """Выгружает указанные профили экспорта (раздел 13 ТЗ) и печатает сводную таблицу.
+               heatmap_params=None):
+    """Выгружает указанные профили экспорта и печатает сводную таблицу.
 
-    ``full`` создаёт ОБА файла (.gpkg + .csv); ``heatmap_networks`` пишет
+    ``full`` создаёт ОБА файла (.gpkg + .csv); ``csv_networks`` пишет
     подкаталог с одним CSV на сеть + манифест — оба профиля не укладываются в
     схему «один профиль → один файл», поэтому обрабатываются явно, а не через
     единый handlers-словарь.
@@ -720,7 +722,7 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
     ISO8601 UTC) сужают ВСЕ профили до заданного периода — полезно, когда в одну
     БД пишется много данных за разные заезды и нужно выделить, например, один день.
 
-    ``map_params`` — секция ``map`` из settings.yaml (тюнинг HTML-карты: шаг сетки,
+    ``heatmap_params`` — секция ``map`` из settings.yaml (тюнинг HTML-карты: шаг сетки,
     IDW, шкала цветов и т.п.); отдельных CLI-флагов у неё нет.
     """
     if not os.path.exists(db_path):
@@ -740,14 +742,14 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
         resolved, candidates = exporter.resolve_bssid_by_ssid(conn, ssid_filter)
         if resolved is None:
             if not candidates:
-                logger.error("Экспорт «heatmap»: сеть с именем %r не найдена", ssid_filter)
+                logger.error("Экспорт «csv»: сеть с именем %r не найдена", ssid_filter)
             else:
                 logger.error(
-                    "Экспорт «heatmap»: имя %r совпадает с %d разными точками "
+                    "Экспорт «csv»: имя %r совпадает с %d разными точками "
                     "(разные MAC) — уточните через --export-bssid: %s",
                     ssid_filter, len(candidates), ", ".join(candidates),
                 )
-            profiles = [p for p in profiles if p != "heatmap"]
+            profiles = [p for p in profiles if p != "csv"]
         else:
             bssid_filter = resolved
 
@@ -765,42 +767,42 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
                     summary.append(("full", "{} точек".format(result["gpkg"]), out_base + ".gpkg"))
                     summary.append(("full", "{} строк".format(result["csv"]), out_base + ".csv"))
 
-                elif profile == "heatmap_networks":
-                    out_dir = os.path.join(EXPORT_DIR, "heatmap_networks_{}".format(ts))
-                    result = exporter.export_heatmap_per_network(conn, out_dir, since=since, until=until)
+                elif profile == "csv_networks":
+                    out_dir = os.path.join(EXPORT_DIR, "csv_networks_{}".format(ts))
+                    result = exporter.export_csv_per_network(conn, out_dir, since=since, until=until)
                     logger.info(
-                        "Экспорт «heatmap_networks»: %d сетей, %d сэмплов → %s%s",
+                        "Экспорт «csv_networks»: %d сетей, %d сэмплов → %s%s",
                         result["networks"], result["samples"], out_dir, os.sep,
                     )
                     summary.append((
-                        "heatmap_networks",
+                        "csv_networks",
                         "{} сетей, {} сэмплов".format(result["networks"], result["samples"]),
                         out_dir + os.sep,
                     ))
 
-                elif profile == "heatmap":
-                    out_path = os.path.join(EXPORT_DIR, "heatmap_{}.csv".format(ts))
-                    count = exporter.export_heatmap_csv(
+                elif profile == "csv":
+                    out_path = os.path.join(EXPORT_DIR, "csv_{}.csv".format(ts))
+                    count = exporter.export_csv(
                         conn, out_path, bssid_filter=bssid_filter, since=since, until=until,
                     )
-                    logger.info("Экспорт «heatmap»: %d строк → %s", count, out_path)
-                    summary.append(("heatmap", "{} строк".format(count), out_path))
+                    logger.info("Экспорт «csv»: %d строк → %s", count, out_path)
+                    summary.append(("csv", "{} строк".format(count), out_path))
 
-                elif profile == "map":
-                    out_path = os.path.join(EXPORT_DIR, "map_{}.html".format(ts))
+                elif profile == "heatmap":
+                    out_path = os.path.join(EXPORT_DIR, "heatmap_{}.html".format(ts))
                     # Интерполяция + рендер тяжелее остальных профилей (секунды-минуты
                     # на больших наборах) — показываем спиннер, чтобы не выглядело зависанием.
                     with ui.spinner("Строим карту (интерполяция и рендер) ..."):
-                        result = exporter.export_map_html(
+                        result = exporter.export_heatmap_html(
                             conn, out_path, bssid_filter=bssid_filter,
-                            since=since, until=until, map_params=map_params,
+                            since=since, until=until, heatmap_params=heatmap_params,
                         )
                     logger.info(
-                        "Экспорт «map»: %d слоёв, %d замеров → %s",
+                        "Экспорт «heatmap»: %d слоёв, %d замеров → %s",
                         result["networks"], result["points"], out_path,
                     )
                     summary.append((
-                        "map",
+                        "heatmap",
                         "{} слоёв, {} замеров".format(result["networks"], result["points"]),
                         out_path,
                     ))
@@ -820,7 +822,7 @@ def do_exports(db_path, profiles, bssid_filter, ssid_filter=None, since=None, un
                 else:
                     logger.warning("Неизвестный профиль экспорта: %s", profile)
 
-            except exporter.MapExportError as exc:
+            except exporter.HeatmapExportError as exc:
                 # Данных не хватило на карту — это не сбой, а объяснимая ситуация:
                 # показываем причину без трейсбека, остальные профили не трогаем.
                 logger.error("Экспорт «%s» не выполнен: %s", profile, exc)
@@ -847,38 +849,61 @@ def build_parser() -> argparse.ArgumentParser:
 режимы (--mode):
   1  мониторинг (Kismet + GPS), 1 карта в monitor mode
   2  проверка точек оператора, 1 карта в managed mode
-  3  оба режима одновременно, 2 разные карты
+  3  оба режима одновременно, 2 разные карты (monitor + managed)
 
---duration (все режимы): 0 -> до Ctrl+C; N>0 -> N секунд
-режим 2/3: проверка точек «по присутствию» — проверяются только видимые сейчас
-           точки (режим 2 — активный скан; режим 3 — пассивно из данных монитора)
+как это работает:
+  * Роли карт привязываются к MAC/USB-пути, а не к имени wlanN: оно может меняться
+    между загрузками. Выбор запоминается — со второго запуска карты подхватятся сами.
+  * Мониторинг пишет по сэмплу сигнала на каждый пойманный кадр: координата — ГДЕ БЫЛ
+    ОПЕРАТОР в этот момент (из GPS), а не расположение точки доступа.
+  * Без GPS-фикса работа не прерывается: записи сохраняются без координат (has_gps=0)
+    и в карту/heatmap не попадают.
+  * Проверка точек (режимы 2/3) идёт «по присутствию» — проверяются только сети,
+    видимые прямо сейчас, поэтому время не тратится на таймауты отсутствующих.
+    Режим 2 — активный скан клиентской картой; режим 3 — пассивно из данных монитора.
+  * --duration (все режимы): 0 -> работать до Ctrl+C; N>0 -> N секунд.
 
 логирование: по умолчанию консоль показывает только майлстоуны, итоги проверки
              точек и warnings/errors; --debug выводит полную детальность.
              Файл лога (settings.yaml: log_file) всегда пишет полный DEBUG.
 
-профили экспорта (--export, раздел 13 ТЗ):
-  heatmap           тепловая карта: все сети в одном CSV (опц. --export-ssid/--export-bssid)
-  heatmap_networks  тепловая карта ПО КАЖДОЙ СЕТИ: CSV на сеть + манифест (каталог)
-  full              полный датасет: создаются ОБА файла — GeoPackage (.gpkg) и CSV
-  wigle             формат WigleWifi-1.4 (сверка/загрузка на wigle.net)
-  ap_status         результаты проверки точек оператора
-  map               готовая интерактивная карта в HTML (открыть в браузере, QGIS не нужен):
-                    сети — переключаемые слои; тюнинг — секция map: в settings.yaml
+профили экспорта (--export, можно несколько сразу):
+  heatmap       ГОТОВАЯ интерактивная карта в HTML: открыть в браузере, QGIS не нужен.
+                Сети — переключаемые слои. Тюнинг — секция heatmap: в settings.yaml
+  csv           сырые сэмплы одним файлом (lat,lon,rssi,bssid,ssid,timestamp)
+  csv_networks  то же, но ОДИН ФАЙЛ НА СЕТЬ + манифест (каталог)
+  full          полный датасет: создаются ОБА файла — GeoPackage (.gpkg) и CSV
+  wigle         формат WigleWifi-1.4 (сверка/загрузка на wigle.net)
+  ap_status     результаты проверки точек оператора (статус, RTT, координаты)
 
---export-since/--export-until: сузить экспорт ЛЮБОГО профиля до периода
-  времени (включительно, UTC) — если в одну БД пишется много данных за
-  разные заезды и нужно выделить, например, один день. Только дата = начало/
-  конец дня — --export-since 2026-07-23 --export-until 2026-07-23 выберет
-  весь этот день целиком.
+фильтры экспорта:
+  --export-ssid / --export-bssid  сузить до одной сети (профили heatmap и csv).
+      Обычный способ — по имени: MAC знать не нужно. Если одно имя вещают разные
+      точки, экспорт попросит уточнить через --export-bssid.
+  --export-since / --export-until  период по времени наблюдения, включительно, UTC.
+      Только дата = весь день целиком.
 
 примеры:
+  # посмотреть, какие адаптеры видны, и выйти
   sudo python -m src.cli --list
-  sudo python -m src.cli                # интерактивное меню
-  sudo python -m src.cli --mode 1 --monitor AA:BB:CC:DD:EE:FF --duration 600 --export heatmap_networks wigle
+
+  # интерактивно: спросит режим и карты
+  sudo python -m src.cli
+
+  # 10 минут мониторинга и сразу готовая карта в HTML
+  sudo python -m src.cli --mode 1 --monitor AA:BB:CC:DD:EE:FF --duration 600 --export heatmap
+
+  # проверка своих точек, отчёт по их статусам
   sudo python -m src.cli --mode 2 --client wlan1 --export ap_status
-  sudo python -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 --duration 1800 --export full
-  sudo python -m src.cli --mode 1 --export full --export-since 2026-07-23 --export-until 2026-07-23
+
+  # полчаса мониторинга + проверка точек параллельно, на выходе карта и Wigle
+  sudo python -m src.cli --mode 3 --monitor AA:BB:CC:DD:EE:FF --client wlan1 \\
+                         --duration 1800 --export heatmap wigle
+
+  # карта одной сети за конкретный день (из уже накопленной базы)
+  sudo python -m src.cli --mode 1 --duration 1 --export heatmap \\
+                         --export-ssid "MyNet_Garage" \\
+                         --export-since 2026-07-23 --export-until 2026-07-23
 """,
     )
 
@@ -1004,12 +1029,12 @@ def main(argv=None) -> int:
 
         run_mode(config, monitor_ad, client_ad, gps, args.duration, channels, mode)
 
-        # Экспорт профилей после отработки режима (раздел 13 ТЗ, --export)
+        # Экспорт профилей после отработки режима (--export)
         if args.export:
             do_exports(
                 config["db_path"], args.export, args.export_bssid, args.export_ssid,
                 since=export_since, until=export_until,
-                map_params=config.get("map"),
+                heatmap_params=config.get("heatmap"),
             )
 
     finally:

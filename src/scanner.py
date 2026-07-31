@@ -14,8 +14,8 @@ src/scanner.py
 
     open | wpa-psk | wpa2-psk | wpa3-sae | wpa2-eap | wep
 
-Замечание по ТЗ §2: скан ищет СВОИ точки (подключаемся тоже только к своим);
-к чужим сетям не подключаемся и пароли не проверяем.
+Важно: скан ищет СВОИ точки (подключаемся тоже только к своим); к чужим сетям
+не подключаемся и пароли не проверяем — они только пассивно наблюдаются.
 """
 
 import logging
@@ -24,7 +24,7 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
-# Канонические типы шифрования, которые понимает ap_checker._write_wpa_conf
+# Канонические типы шифрования, которые понимает ap_checker
 SEC_OPEN = "open"
 SEC_WPA = "wpa-psk"
 SEC_WPA2 = "wpa2-psk"
@@ -288,10 +288,40 @@ def scan_visible(iface, timeout=20):
 if __name__ == "__main__":
     import sys
 
+    USAGE = """
+Разовый скан эфира: что видно клиентской картой прямо сейчас.
+
+  sudo python3 -m src.scanner <iface>
+
+Аргументы:
+  <iface>  managed-интерфейс (НЕ monitor). Требуется root.
+
+Выводит по строке на сеть: BSSID, SSID (скрытые — <hidden>), сигнал в dBm,
+распознанный тип шифрования и частоту.
+
+Как это работает:
+  * Это АКТИВНЫЙ скан (`iw dev <iface> scan`) — карта сама шлёт probe request.
+    Так режим 2 узнаёт, какие «свои» точки рядом, чтобы не тратить таймауты
+    на отсутствующие. Чужие сети при этом только наблюдаются: подключений
+    к ним не делается и пароли не проверяются.
+  * Тип шифрования определяется из beacon-а, а не из конфига: у оператора
+    в ap_targets.yaml есть только имя сети и пароль.
+  * Если карта занята ассоциацией, скан может вернуть «busy» — это нормально,
+    в рабочем цикле следующая итерация повторит попытку.
+
+Примеры:
+  # посмотреть, видна ли своя точка с этого места
+  sudo python3 -m src.scanner wlan1
+
+  # найти конкретную сеть в длинном списке
+  sudo python3 -m src.scanner wlan1 | grep -i "MyNet"
+""".strip()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(USAGE)
+        sys.exit(0 if len(sys.argv) > 1 else 1)
+
     logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
-    if len(sys.argv) < 2:
-        print("Использование: sudo python3 -m src.scanner <iface>")
-        sys.exit(1)
 
     for n in scan_visible(sys.argv[1]):
         print("{:<20} {:<28} {:>4} dBm  {:<10} {}".format(

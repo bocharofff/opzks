@@ -1,4 +1,4 @@
-"""Группировка измерений по BSSID, правило именования и отбор сетей (FR-2, FR-3)."""
+"""Группировка измерений по BSSID, правило именования и отбор сетей для слоёв."""
 
 from __future__ import annotations
 
@@ -33,7 +33,11 @@ def _is_hidden(ssid: str, bssid: str) -> bool:
 
 
 def build_network_index(df: pd.DataFrame) -> dict[str, NetworkSummary]:
-    """Строит сводку по каждому BSSID и присваивает отображаемые имена по правилу FR-3."""
+    """Строит сводку по каждому BSSID и присваивает отображаемые имена слоёв.
+
+    Имена сетей не уникальны: одинаковые SSID различаются суффиксами «(1)», «(2)»,
+    скрытые сети (пустой SSID) показываются своим MAC.
+    """
 
     grouped = df.groupby("bssid", sort=False)
     stats = grouped.agg(

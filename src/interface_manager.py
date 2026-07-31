@@ -217,25 +217,36 @@ if __name__ == "__main__":
     import sys
 
     USAGE = """
-Использование (необходим root):
+Ручное переключение режимов Wi-Fi карты (то же, что делает оркестратор сам).
 
-  python -m src.interface_manager monitor <iface>
-      Перевести <iface> в monitor mode. Вывести имя результирующего интерфейса.
+  sudo python3 -m src.interface_manager <действие> <iface>
 
-  python -m src.interface_manager managed <iface>
-      Вернуть <iface> в managed mode.
+Действия:
+  monitor <iface>    перевести в monitor mode; печатает имя результирующего
+                     интерфейса (может отличаться от исходного: wlan0 -> wlan0mon)
+  managed <iface>    вернуть в обычный managed mode
+  unmanage <iface>   запретить NetworkManager управлять картой
+  restore <iface>    вернуть карту под управление NetworkManager
 
-  python -m src.interface_manager unmanage <iface>
-      Запретить NetworkManager управлять <iface>.
-
-  python -m src.interface_manager restore <iface>
-      Вернуть NetworkManager управление <iface>.
+Как это работает:
+  * Требуется root — операции меняют состояние сетевых интерфейсов.
+  * monitor сначала пробует airmon-ng, при неудаче — ручной путь ip+iw.
+    Имя интерфейса после переключения МОЖЕТ измениться, поэтому оно печатается.
+  * unmanage нужен перед переводом в monitor: иначе NetworkManager вмешается
+    и вернёт карту обратно. Клиентскую карту в режиме 3 трогать не нужно —
+    она должна остаться управляемой, чтобы подключаться к точкам.
+  * Обратный порядок при откате: сначала managed, потом restore.
+  * Обычно вызывать вручную не требуется — cli.py делает это сам и всегда
+    восстанавливает интерфейс при выходе, в том числе после Ctrl+C.
 
 Примеры:
-  sudo python -m src.interface_manager monitor wlan0
-  sudo python -m src.interface_manager managed wlan0mon
-  sudo python -m src.interface_manager unmanage wlan0
-  sudo python -m src.interface_manager restore wlan0
+  # подготовить карту к захвату эфира вручную (эквивалент шагов режима 1)
+  sudo python3 -m src.interface_manager unmanage wlan0
+  sudo python3 -m src.interface_manager monitor wlan0
+
+  # вернуть всё как было, если процесс упал и не успел прибраться
+  sudo python3 -m src.interface_manager managed wlan0mon
+  sudo python3 -m src.interface_manager restore wlan0
 """.strip()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")

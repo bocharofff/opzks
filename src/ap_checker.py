@@ -610,20 +610,43 @@ if __name__ == "__main__":
     import sys
 
     USAGE = """
-Использование (необходим root):
+Разовая проверка своих точек доступа: подключиться и проверить выход в интернет.
 
-  sudo python3 -m src.ap_checker <интерфейс> <ap_targets.yaml>
+  sudo python3 -m src.ap_checker <iface> <ap_targets.yaml>
 
-  Запускает проверку всех включённых точек из файла и выводит результаты.
-  БД не используется (результаты только в stdout).
+Аргументы:
+  <iface>            managed-интерфейс (НЕ monitor). Требуется root.
+  <ap_targets.yaml>  файл со своими точками (имя сети + пароль)
 
-Пример:
-  sudo python3 -m src.ap_checker wlan0 config/ap_targets.yaml
+Проверяет ВСЕ включённые точки из файла подряд и печатает таблицу
+«точка / статус / RTT». База не используется — результаты только в stdout.
+
+Как это работает:
+  * Цикл по точке: ассоциация -> получение адреса по DHCP -> запрос к
+    контрольному адресу (generate_204) -> результат. Эндпоинт generate_204
+    отличает реальный интернет от перехвата captive-порталом.
+  * Подключение идёт ПО ИМЕНИ сети: BSSID в конфиге не нужен. Тип шифрования
+    берётся из ap_targets.yaml, а если не указан — определяется из эфира.
+  * Проверяются только СВОИ точки из файла; к чужим сетям подключений нет.
+  * Здесь проверяются все точки подряд, включая отсутствующие (на каждую
+    уйдёт полный таймаут). В рабочих режимах 2/3 оркестратор проверяет
+    только те, что реально видны сейчас, — это заметно быстрее.
+  * Пароли не попадают ни в логи, ни в результат, ни в экспорт.
+
+Статусы: ok — интернет есть; captive_portal — перехват; no_assoc — не
+подключились; no_dhcp — нет адреса; no_dns — не резолвит; no_inet/timeout —
+нет ответа; eap_unsupported — сети 802.1X одного пароля недостаточно.
 
 Требования:
-  - <интерфейс> должен быть в managed mode (не monitor)
-  - wpa_supplicant, wpa_cli, dhclient, iw должны быть установлены
-  - ap_targets.yaml должен иметь права 600
+  * wpa_supplicant, wpa_cli, dhclient, iw установлены
+  * ap_targets.yaml с правами 600 (в нём пароли)
+
+Примеры:
+  # проверить все свои точки один раз
+  sudo python3 -m src.ap_checker wlan1 config/ap_targets.yaml
+
+  # рабочий путь: проверять только видимые сейчас точки, с записью в базу
+  sudo python3 -m src.cli --mode 2 --client wlan1 --export ap_status
 """.strip()
 
     logging.basicConfig(
@@ -631,9 +654,9 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
         print(USAGE)
-        sys.exit(1)
+        sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help") else 1)
 
     iface         = sys.argv[1]
     targets_path  = sys.argv[2]

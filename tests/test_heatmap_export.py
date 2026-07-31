@@ -67,7 +67,7 @@ def _read(path):
 
 def test_map_builds_html_with_layers(seeded, tmp_path):
     out = str(tmp_path / "map.html")
-    result = exporter.export_map_html(seeded, out)
+    result = exporter.export_heatmap_html(seeded, out)
 
     assert result["networks"] == 2          # обе сети прошли min_points=20
     assert result["points"] == 70
@@ -84,7 +84,7 @@ def test_map_builds_html_with_layers(seeded, tmp_path):
 def test_map_output_is_self_contained_no_local_refs(seeded, tmp_path):
     # Карта должна открываться как один файл: локальных ссылок на соседние файлы быть не должно
     out = str(tmp_path / "map.html")
-    exporter.export_map_html(seeded, out)
+    exporter.export_heatmap_html(seeded, out)
     html = _read(out)
     assert "file://" not in html
     assert os.path.basename(str(tmp_path)) not in html
@@ -96,7 +96,7 @@ def test_map_output_is_self_contained_no_local_refs(seeded, tmp_path):
 
 def test_map_bssid_filter_builds_single_layer(seeded, tmp_path):
     out = str(tmp_path / "one.html")
-    result = exporter.export_map_html(seeded, out, bssid_filter=NET_A["bssid"])
+    result = exporter.export_heatmap_html(seeded, out, bssid_filter=NET_A["bssid"])
 
     assert result["networks"] == 1
     html = _read(out)
@@ -109,7 +109,7 @@ def test_map_since_until_narrows_to_one_day(seeded, tmp_path):
     until = exporter.normalize_time_bound(DAY2, end_of_day=True)
     out = str(tmp_path / "day2.html")
 
-    result = exporter.export_map_html(seeded, out, since=since, until=until)
+    result = exporter.export_heatmap_html(seeded, out, since=since, until=until)
 
     assert result["networks"] == 1          # NetA (день1) вне окна
     assert result["points"] == 30
@@ -121,7 +121,7 @@ def test_map_since_until_narrows_to_one_day(seeded, tmp_path):
 def test_map_period_in_title(seeded, tmp_path):
     since = exporter.normalize_time_bound(DAY2)
     out = str(tmp_path / "titled.html")
-    exporter.export_map_html(seeded, out, since=since)
+    exporter.export_heatmap_html(seeded, out, since=since)
     assert "период" in _read(out)
 
 
@@ -130,13 +130,13 @@ def test_map_period_in_title(seeded, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_map_empty_db_raises_map_export_error(conn, tmp_path):
-    with pytest.raises(exporter.MapExportError):
-        exporter.export_map_html(conn, str(tmp_path / "empty.html"))
+    with pytest.raises(exporter.HeatmapExportError):
+        exporter.export_heatmap_html(conn, str(tmp_path / "empty.html"))
 
 
 def test_map_empty_period_raises_map_export_error(seeded, tmp_path):
-    with pytest.raises(exporter.MapExportError) as exc:
-        exporter.export_map_html(
+    with pytest.raises(exporter.HeatmapExportError) as exc:
+        exporter.export_heatmap_html(
             seeded, str(tmp_path / "none.html"),
             since="2000-01-01T00:00:00Z", until="2000-01-02T23:59:59Z",
         )
@@ -144,9 +144,9 @@ def test_map_empty_period_raises_map_export_error(seeded, tmp_path):
 
 
 def test_map_too_strict_min_points_raises_map_export_error(seeded, tmp_path):
-    with pytest.raises(exporter.MapExportError) as exc:
-        exporter.export_map_html(
-            seeded, str(tmp_path / "none.html"), map_params={"min_points": 100_000},
+    with pytest.raises(exporter.HeatmapExportError) as exc:
+        exporter.export_heatmap_html(
+            seeded, str(tmp_path / "none.html"), heatmap_params={"min_points": 100_000},
         )
     assert "min_points" in str(exc.value)
 
@@ -161,25 +161,25 @@ def test_map_observations_without_gps_are_ignored(conn, tmp_path):
         })
     conn.commit()
 
-    with pytest.raises(exporter.MapExportError):
-        exporter.export_map_html(conn, str(tmp_path / "nogps.html"))
+    with pytest.raises(exporter.HeatmapExportError):
+        exporter.export_heatmap_html(conn, str(tmp_path / "nogps.html"))
 
 
 # ---------------------------------------------------------------------------
 # Настройки из секции map
 # ---------------------------------------------------------------------------
 
-def test_map_params_top_limits_layers(seeded, tmp_path):
+def test_heatmap_params_top_limits_layers(seeded, tmp_path):
     out = str(tmp_path / "top1.html")
-    result = exporter.export_map_html(seeded, out, map_params={"top": 1})
+    result = exporter.export_heatmap_html(seeded, out, heatmap_params={"top": 1})
     assert result["networks"] == 1
 
 
-def test_map_params_show_points_adds_points_layer(seeded, tmp_path):
+def test_heatmap_params_show_points_adds_points_layer(seeded, tmp_path):
     out_off = str(tmp_path / "off.html")
     out_on = str(tmp_path / "on.html")
-    exporter.export_map_html(seeded, out_off, map_params={"show_points": False})
-    exporter.export_map_html(seeded, out_on, map_params={"show_points": True})
+    exporter.export_heatmap_html(seeded, out_off, heatmap_params={"show_points": False})
+    exporter.export_heatmap_html(seeded, out_on, heatmap_params={"show_points": True})
 
     # Проверяем сами маркеры, а не подпись слоя: folium экранирует кириллицу
     # в JS-именах слоёв (точки), искать её как текст нельзя.
@@ -187,10 +187,10 @@ def test_map_params_show_points_adds_points_layer(seeded, tmp_path):
     assert _read(out_on).count("circleMarker") == 70   # все замеры обеих сетей
 
 
-def test_map_params_partial_override_keeps_other_defaults(seeded, tmp_path):
-    # Передаём только один параметр — остальные должны браться из _MAP_DEFAULTS
+def test_heatmap_params_partial_override_keeps_other_defaults(seeded, tmp_path):
+    # Передаём только один параметр — остальные должны браться из _HEATMAP_DEFAULTS
     out = str(tmp_path / "partial.html")
-    result = exporter.export_map_html(seeded, out, map_params={"grid_step_m": 5.0})
+    result = exporter.export_heatmap_html(seeded, out, heatmap_params={"grid_step_m": 5.0})
     assert result["networks"] == 2           # min_points=20 по умолчанию не потерялся
 
 
@@ -198,7 +198,7 @@ def test_map_defaults_mirror_config_section():
     # Дефолты экспортёра и конфига должны совпадать, иначе автономный запуск
     # (без settings.yaml) вёл бы себя иначе, чем через оркестратор.
     from src.config import _DEFAULTS
-    assert exporter._MAP_DEFAULTS == _DEFAULTS["map"]
+    assert exporter._HEATMAP_DEFAULTS == _DEFAULTS["heatmap"]
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +225,10 @@ def test_do_exports_map_writes_html_and_summary(seeded, tmp_path, monkeypatch):
     db_path = _db_file_copy(seeded, str(tmp_path / "wifi.db"))
     monkeypatch.setattr(cli, "EXPORT_DIR", str(tmp_path / "exp"))
 
-    cli.do_exports(db_path, ["map"], bssid_filter=None, ssid_filter=None)
+    cli.do_exports(db_path, ["heatmap"], bssid_filter=None, ssid_filter=None)
 
     files = os.listdir(str(tmp_path / "exp"))
-    html_files = [f for f in files if f.startswith("map_") and f.endswith(".html")]
+    html_files = [f for f in files if f.startswith("heatmap_") and f.endswith(".html")]
     assert len(html_files) == 1
 
 
@@ -237,9 +237,9 @@ def test_do_exports_map_failure_does_not_break_other_profiles(tmp_path, conn, mo
     db_path = _db_file_copy(conn, str(tmp_path / "empty.db"))
     monkeypatch.setattr(cli, "EXPORT_DIR", str(tmp_path / "exp2"))
 
-    cli.do_exports(db_path, ["map", "ap_status"], bssid_filter=None, ssid_filter=None)
+    cli.do_exports(db_path, ["heatmap", "ap_status"], bssid_filter=None, ssid_filter=None)
 
     files = os.listdir(str(tmp_path / "exp2"))
-    assert not any(f.startswith("map_") for f in files)      # карта не построена
+    assert not any(f.startswith("heatmap_") for f in files)      # карта не построена
     assert any(f.startswith("ap_status_") for f in files)    # соседний профиль отработал
     assert "не выполнен" in caplog.text                      # причина показана без трейсбека

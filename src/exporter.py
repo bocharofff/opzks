@@ -2,13 +2,16 @@
 """
 src/exporter.py
 
-Экспортирует данные из SQLite базы в форматы раздела 13 ТЗ:
-    heatmap           CSV   — тепловая карта (все сети вперемешку, опц. фильтр по ssid/bssid)
-    heatmap_networks  CSV×N — тепловая карта ПО КАЖДОЙ СЕТИ (один файл на BSSID + манифест)
-    full              GPKG + CSV — полный датасет (оба файла всегда)
-    wigle             CSV   — формат WigleWifi-1.4 (для сверки/загрузки на wigle.net)
-    ap_status         CSV   — результаты проверки точек оператора
-    map               HTML  — готовая интерактивная карта (сети — слои), без QGIS
+Экспортирует данные из SQLite базы в форматы для внешнего анализа:
+    heatmap       HTML  — готовая интерактивная карта (сети — слои), открыть в браузере
+    csv           CSV   — сырые сэмплы сигнала (все сети, опц. фильтр по ssid/bssid)
+    csv_networks  CSV×N — то же, но ОДИН ФАЙЛ НА СЕТЬ + манифест (каталог)
+    full          GPKG + CSV — полный датасет (оба файла всегда)
+    wigle         CSV   — формат WigleWifi-1.4 (для сверки/загрузки на wigle.net)
+    ap_status     CSV   — результаты проверки точек оператора
+
+heatmap — готовый результат «просто открыть»; csv/csv_networks/full — исходники
+для самостоятельного анализа в QGIS.
 
 Запускается напрямую: python -m src.exporter --profile <профиль>
 """
@@ -39,9 +42,9 @@ logger = logging.getLogger(__name__)
 _WGS84_SRS_ID = 4326
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
-#: Дефолты профиля ``map`` на случай вызова export_map_html без конфига
-#: (автономный запуск/тесты). Зеркалируют config._DEFAULTS["map"].
-_MAP_DEFAULTS = {
+#: Дефолты профиля ``heatmap`` на случай вызова export_heatmap_html без конфига
+#: (автономный запуск/тесты). Зеркалируют config._DEFAULTS["heatmap"].
+_HEATMAP_DEFAULTS = {
     "top": 10,
     "min_points": 20,
     "grid_step_m": 3.0,
@@ -65,7 +68,7 @@ _MAP_DEFAULTS = {
 }
 
 
-class MapExportError(Exception):
+class HeatmapExportError(Exception):
     """Карту построить не удалось: данных не хватило или они не прошли отбор.
 
     Отдельный тип, чтобы вызывающий код (CLI) показал оператору понятную причину
@@ -242,15 +245,22 @@ def resolve_bssid_by_ssid(conn, ssid):
     return None, candidates
 
 
-def export_heatmap_csv(conn, output_path, bssid_filter=None, since=None, until=None):
-    """
-    Экспорт для тепловых карт в QGIS.
-    Только наблюдения с GPS-координатами (has_gps = 1).
-    Опционально сужается по конкретной сети (``bssid_filter``) и/или периоду
-    времени (``since``/``until`` — ISO8601 UTC, обе границы включительно;
-    см. :func:`normalize_time_bound`) — полезно, когда в одну БД пишется много
-    данных за разные заезды и нужно выделить, например, один день.
-    Возвращает количество строк.
+def export_csv(conn, output_path, bssid_filter=None, since=None, until=None):
+    """Сырые сэмплы сигнала одним CSV — исходник для анализа в QGIS.
+
+    Колонки ``lat, lon, rssi, bssid, ssid, timestamp``: каждая строка — один
+    замер (координата приёмника → сила сигнала). В QGIS такой файл добавляется
+    как «Delimited Text» (X=lon, Y=lat, EPSG:4326) и интерполируется вручную.
+    Готовую карту без QGIS даёт профиль ``heatmap`` (:func:`export_heatmap_html`).
+
+    Только наблюдения с GPS-координатами (``has_gps = 1``). Опционально сужается
+    по конкретной сети (``bssid_filter``) и/или периоду времени (``since``/``until``
+    — ISO8601 UTC, обе границы включительно; см. :func:`normalize_time_bound`) —
+    полезно, когда в одну БД пишется много данных за разные заезды и нужно
+    выделить, например, один день.
+
+    Returns:
+        Количество записанных строк.
     """
     where = ["o.has_gps = 1"]
     params = []
@@ -274,32 +284,31 @@ def export_heatmap_csv(conn, output_path, bssid_filter=None, since=None, until=N
     rows = conn.execute(sql, params).fetchall()
 
     if bssid_filter:
-        logger.info("Heatmap: фильтр по BSSID %s", bssid_filter)
+        logger.info("CSV: фильтр по BSSID %s", bssid_filter)
     if since or until:
-        logger.info("Heatmap: диапазон времени %s .. %s", since or "-inf", until or "+inf")
+        logger.info("CSV: диапазон времени %s .. %s", since or "-inf", until or "+inf")
 
     header = ["lat", "lon", "rssi", "bssid", "ssid", "timestamp"]
     count = _write_csv(output_path, header, rows)
 
     if count == 0:
         logger.warning(
-            "Heatmap: нет данных с GPS-координатами%s",
+            "CSV: нет данных с GPS-координатами%s",
             " для BSSID {}".format(bssid_filter) if bssid_filter else "",
         )
     else:
-        logger.info("Heatmap: экспортировано %d строк → %s", count, output_path)
+        logger.info("CSV: экспортировано %d строк → %s", count, output_path)
     return count
 
 
-def export_heatmap_per_network(conn, out_dir, since=None, until=None):
-    """Тепловая карта ПО КАЖДОЙ СЕТИ: один CSV на BSSID + манифест.
+def export_csv_per_network(conn, out_dir, since=None, until=None):
+    """Сырые сэмплы сигнала ПО КАЖДОЙ СЕТИ: один CSV на BSSID + манифест.
 
     Каждая сеть уже имеет множество сэмплов ``(lat, lon, rssi)`` в разных
-    точках маршрута (см. kismet_runner: packets → observations). Раньше их
-    приходилось разбирать по одному BSSID вручную (``--export-bssid``); этот
-    профиль делает то же самое сразу для ВСЕХ сетей за один вызов — каждый
-    файл сразу готов к интерполяции (IDW) в QGIS без дополнительной фильтрации
-    (раздел 14 ТЗ).
+    точках маршрута (см. kismet_runner: packets → observations). Разбирать их
+    по одному BSSID вручную (``--export-bssid``) неудобно; этот профиль делает
+    то же самое сразу для ВСЕХ сетей за один вызов — каждый файл сразу готов
+    к интерполяции (IDW) в QGIS без дополнительной фильтрации.
 
     ``since``/``until`` (см. :func:`normalize_time_bound`) сужают и отбор
     сетей, и содержимое каждого файла до заданного периода — полезно, когда
@@ -344,7 +353,7 @@ def export_heatmap_per_network(conn, out_dir, since=None, until=None):
             _sanitize_filename(ssid), _sanitize_filename(bssid)
         )
         out_path = os.path.join(out_dir, filename)
-        count = export_heatmap_csv(conn, out_path, bssid_filter=bssid, since=since, until=until)
+        count = export_csv(conn, out_path, bssid_filter=bssid, since=since, until=until)
 
         manifest_rows.append([bssid, ssid or "", count, filename])
         total_samples += count
@@ -353,10 +362,10 @@ def export_heatmap_per_network(conn, out_dir, since=None, until=None):
     _write_csv(manifest_path, ["bssid", "ssid", "n_samples", "file"], manifest_rows)
 
     if not bssids:
-        logger.warning("Heatmap по сетям: нет данных с GPS-координатами")
+        logger.warning("CSV по сетям: нет данных с GPS-координатами")
     else:
         logger.info(
-            "Heatmap по сетям: %d сетей, %d сэмплов → %s",
+            "CSV по сетям: %d сетей, %d сэмплов → %s",
             len(bssids), total_samples, out_dir,
         )
     return {"networks": len(bssids), "samples": total_samples}
@@ -414,9 +423,9 @@ def export_full_dataset_csv(conn, output_path, since=None, until=None):
 def export_full_dataset_gpkg(conn, output_path, since=None, until=None):
     """Полный датасет в формате GeoPackage (.gpkg) — пространственный слой точек.
 
-    Раздел 13 ТЗ требует GeoPackage для полного датасета (готовый слой для QGIS,
-    без ручного «Add Delimited Text»). Пишется через ``pygeopkg`` (pure-python,
-    без GDAL) — уместно для автономной установки на Kali/OVA.
+    GeoPackage — готовый слой для QGIS: открывается перетаскиванием, без ручного
+    «Add Delimited Text» и указания колонок координат. Пишется через ``pygeopkg``
+    (pure-python, без GDAL) — уместно для автономной установки на Kali/OVA.
 
     Включаются только наблюдения с координатами (``has_gps=1``) — геометрия
     точки без координат не имеет смысла; полная таблица (в т.ч. записи без
@@ -517,7 +526,7 @@ def export_full_dataset_gpkg(conn, output_path, since=None, until=None):
 
 
 def export_full_dataset(conn, out_base, since=None, until=None):
-    """Полный датасет — ОБА формата сразу (раздел 13 ТЗ: GeoPackage (.gpkg) / CSV).
+    """Полный датасет — ОБА формата сразу: GeoPackage (.gpkg) и CSV.
 
     Args:
         conn:     Соединение с БД.
@@ -620,9 +629,9 @@ def export_wigle_csv(conn, output_path, since=None, until=None):
     return count
 
 
-def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None,
-                    map_params=None):
-    """Интерактивная тепловая карта в HTML — готовый результат без QGIS (раздел 14 ТЗ).
+def export_heatmap_html(conn, output_path, bssid_filter=None, since=None, until=None,
+                    heatmap_params=None):
+    """Интерактивная тепловая карта в HTML — готовый результат, QGIS не нужен.
 
     Берёт те же наблюдения, что и профиль ``heatmap`` (только ``has_gps=1``), но вместо
     CSV для ручной интерполяции в QGIS сразу строит карту: IDW-интерполяция на сетку,
@@ -638,14 +647,14 @@ def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None
         bssid_filter: Ограничить одной сетью (уже разрешённый MAC; см. resolve_bssid_by_ssid).
         since:        Нижняя граница времени наблюдений (ISO8601 UTC), включительно.
         until:        Верхняя граница времени наблюдений (ISO8601 UTC), включительно.
-        map_params:   Секция ``map`` из конфига (см. config._DEFAULTS["map"]);
+        heatmap_params:   Секция ``map`` из конфига (см. config._DEFAULTS["heatmap"]);
                       ``None`` — взять дефолты модуля.
 
     Returns:
         ``{"networks": <слоёв построено>, "points": <замеров учтено>, "bytes": <размер файла>}``.
 
     Raises:
-        MapExportError: данных не хватило на карту (нет замеров с GPS, ни одна сеть не
+        HeatmapExportError: данных не хватило на карту (нет замеров с GPS, ни одна сеть не
             прошла отбор и т.п.) — сообщение пригодно для показа оператору.
     """
     where = ["o.has_gps = 1"]
@@ -673,19 +682,19 @@ def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None
         columns=["lat", "lon", "rssi", "bssid", "ssid", "timestamp"],
     )
     if raw.empty:
-        raise MapExportError(
+        raise HeatmapExportError(
             "Нет наблюдений с GPS-координатами для карты"
             + (" (с учётом заданных фильтров)" if (bssid_filter or since or until) else "")
         )
 
-    cfg = dict(_MAP_DEFAULTS)
-    if map_params:
-        cfg.update(map_params)
+    cfg = dict(_HEATMAP_DEFAULTS)
+    if heatmap_params:
+        cfg.update(heatmap_params)
 
     try:
         df, report = validate_measurements(raw, source_name="база наблюдений")
     except LoaderError as exc:
-        raise MapExportError(str(exc)) from exc
+        raise HeatmapExportError(str(exc)) from exc
     logger.debug("Карта: %s", report.format().replace("\n", "; "))
 
     index = build_network_index(df)
@@ -699,7 +708,7 @@ def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None
         logger.debug("Карта: %s", warning)
 
     if not selection.networks:
-        raise MapExportError(
+        raise HeatmapExportError(
             "Ни одна сеть не прошла отбор для карты (min_points={}). "
             "Уменьшите map.min_points в settings.yaml или соберите больше данных.".format(
                 cfg["min_points"]
@@ -757,7 +766,7 @@ def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None
         points_used += net.n_points
 
     if not layers:
-        raise MapExportError("Ни для одной сети не удалось построить сетку интерполяции")
+        raise HeatmapExportError("Ни для одной сети не удалось построить сетку интерполяции")
 
     scale_desc = "авто" if render_params.rssi_auto else "{:g}..{:g} дБм".format(
         render_params.rssi_min, render_params.rssi_max
@@ -779,10 +788,10 @@ def export_map_html(conn, output_path, bssid_filter=None, since=None, until=None
         m = build_map(layers, render_params=render_params, title=title, show_points=show_points)
         size_bytes = save_map(m, output_path)
     except ValueError as exc:
-        raise MapExportError(str(exc)) from exc
+        raise HeatmapExportError(str(exc)) from exc
 
     logger.info(
-        "Map: %d слоёв, %d замеров → %s (%.1f КБ)",
+        "Heatmap: %d слоёв, %d замеров → %s (%.1f КБ)",
         len(layers), points_used, output_path, size_bytes / 1024,
     )
     return {"networks": len(layers), "points": points_used, "bytes": size_bytes}
@@ -829,52 +838,72 @@ def export_ap_status_csv(conn, output_path, since=None, until=None):
 
 # Профили с одним выходным файлом (для них argparse-обвязка одинакова)
 _SINGLE_FILE_PROFILES = {
-    "heatmap":   export_heatmap_csv,
+    "csv":       export_csv,
     "wigle":     export_wigle_csv,
     "ap_status": export_ap_status_csv,
 }
-# Все профили — для справки/валидации choices (full/heatmap_networks/map — особые:
+# Все профили — для справки/валидации choices (full/csv_networks/heatmap — особые:
 # два файла, каталог и HTML соответственно)
-EXPORT_PROFILES = tuple(_SINGLE_FILE_PROFILES) + ("full", "heatmap_networks", "map")
+EXPORT_PROFILES = tuple(_SINGLE_FILE_PROFILES) + ("full", "csv_networks", "heatmap")
 
 if __name__ == "__main__":
     import sys
 
     # Пробуем подгрузить конфиг проекта — если модуль доступен
-    _map_params = None
+    _heatmap_params = None
     try:
         from src.config import load_config
         _config = load_config()
         _default_db = _config.get("db_path", "data/wifi_monitor.db")
         # Тюнинг карты живёт только в settings.yaml (CLI-флагов у него нет)
-        _map_params = _config.get("map")
+        _heatmap_params = _config.get("heatmap")
     except Exception:
         _default_db = "data/wifi_monitor.db"
 
     parser = argparse.ArgumentParser(
         prog="python -m src.exporter",
-        description="Экспорт данных wifi-monitor в форматы раздела 13 ТЗ",
+        description="Экспорт данных wifi-monitor: карта, CSV, GeoPackage, Wigle",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 профили:
-  heatmap           Тепловая карта в QGIS: все сети в одном CSV (опц. --ssid/--bssid)
-  heatmap_networks  Тепловая карта ПО КАЖДОЙ СЕТИ: CSV на сеть + манифест (каталог)
-  full              Полный датасет: GeoPackage (.gpkg) + CSV — создаются ОБА файла
-  wigle             Формат WigleWifi-1.4 для сверки/загрузки на wigle.net
-  ap_status         Результаты проверки точек оператора
-  map               Готовая интерактивная карта в HTML (браузер, без QGIS): сети —
-                    переключаемые слои. Тюнинг — секция map: в config/settings.yaml
+  heatmap       ГОТОВАЯ интерактивная карта в HTML: открыть в браузере, QGIS не нужен.
+                Сети — переключаемые слои, цвет = сила сигнала. Тюнинг (шаг сетки, IDW,
+                шкала, число слоёв) — секция heatmap: в config/settings.yaml
+  csv           Сырые сэмплы одним файлом: lat,lon,rssi,bssid,ssid,timestamp.
+                Исходник для самостоятельной интерполяции в QGIS
+  csv_networks  То же, но ОДИН ФАЙЛ НА СЕТЬ + _manifest.csv (каталог) — не нужно
+                фильтровать по одной сети вручную
+  full          Полный датасет: GeoPackage (.gpkg) + CSV — создаются ОБА файла.
+                .gpkg открывается в QGIS перетаскиванием; .csv включает записи без GPS
+  wigle         Формат WigleWifi-1.4 для сверки/загрузки на wigle.net
+  ap_status     Результаты проверки точек оператора (ap_id, статус, RTT, координаты)
+
+как это работает:
+  * Все профили, кроме ap_status, берут наблюдения ТОЛЬКО с GPS-координатами.
+  * --ssid/--bssid сужают выборку до одной сети (только heatmap и csv).
+    Обычный способ — --ssid: MAC знать не нужно. Если одно имя вещают несколько
+    разных точек, экспорт попросит уточнить через --bssid.
+  * --since/--until отбирают период по времени наблюдения (обе границы включительно).
+    Только дата = весь день целиком.
 
 примеры:
+  # готовая карта по всем сетям — просто открыть получившийся HTML
   python -m src.exporter --profile heatmap
+
+  # карта одной сети по её имени (MAC знать не нужно)
   python -m src.exporter --profile heatmap --ssid "MyNet_Garage"
-  python -m src.exporter --profile heatmap --bssid AA:BB:CC:DD:EE:FF
-  python -m src.exporter --profile heatmap_networks
+
+  # карта только за один день (когда в базе накоплено несколько заездов)
+  python -m src.exporter --profile heatmap --since 2026-07-23 --until 2026-07-23
+
+  # сырые сэмплы для ручного анализа в QGIS: все сети / отдельными файлами
+  python -m src.exporter --profile csv
+  python -m src.exporter --profile csv_networks
+
+  # полный датасет из конкретной базы (создаст .gpkg и .csv)
   python -m src.exporter --profile full --db data/wifi_monitor.db
-  python -m src.exporter --profile full --since 2026-07-23 --until 2026-07-23
-  python -m src.exporter --profile map
-  python -m src.exporter --profile map --ssid "MyNet_Garage" --since 2026-07-23
-  python -m src.exporter --profile wigle
+
+  # отчёт по своим точкам доступа в заданный файл
   python -m src.exporter --profile ap_status --out /tmp/report.csv
         """,
     )
@@ -887,14 +916,14 @@ if __name__ == "__main__":
     bssid_group.add_argument(
         "--ssid",
         metavar="<имя сети>",
-        help="Фильтр по имени сети (для профилей heatmap и map). Обычный способ "
+        help="Фильтр по имени сети (для профилей heatmap и csv). Обычный способ "
              "выбрать сеть — MAC знать не нужно; если несколько разных точек "
              "вещают одно и то же имя, попросит уточнить через --bssid",
     )
     bssid_group.add_argument(
         "--bssid",
         metavar="AA:BB:CC:DD:EE:FF",
-        help="Фильтр по MAC точки (для профилей heatmap и map) — нужен только "
+        help="Фильтр по MAC точки (для профилей heatmap и csv) — нужен только "
              "для разрешения коллизии одинаковых имён сетей",
     )
     parser.add_argument(
@@ -906,7 +935,7 @@ if __name__ == "__main__":
         "--out",
         metavar="<путь>",
         help="Путь к выходу: файл для одиночных профилей, БЕЗ расширения для "
-             "full (.gpkg/.csv добавятся сами), каталог для heatmap_networks "
+             "full (.gpkg/.csv добавятся сами), каталог для csv_networks "
              "(default: export/<профиль>_<timestamp>[.csv])",
     )
     parser.add_argument(
@@ -924,8 +953,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Валидация: --ssid/--bssid имеют смысл только там, где отбирается одна сеть
-    if (args.ssid or args.bssid) and args.profile not in ("heatmap", "map"):
-        parser.error("--ssid/--bssid можно использовать только с --profile heatmap или map")
+    if (args.ssid or args.bssid) and args.profile not in ("csv", "heatmap"):
+        parser.error("--ssid/--bssid можно использовать только с --profile heatmap или csv")
 
     try:
         since = normalize_time_bound(args.since, end_of_day=False)
@@ -972,20 +1001,20 @@ if __name__ == "__main__":
             print("Экспортировано: {} точек → {}.gpkg, {} строк → {}.csv".format(
                 result["gpkg"], out_base, result["csv"], out_base,
             ))
-        elif args.profile == "heatmap_networks":
-            out_dir = args.out or "export/heatmap_networks_{}".format(_ts())
-            result = export_heatmap_per_network(conn, out_dir, since=since, until=until)
+        elif args.profile == "csv_networks":
+            out_dir = args.out or "export/csv_networks_{}".format(_ts())
+            result = export_csv_per_network(conn, out_dir, since=since, until=until)
             print("Экспортировано: {} сетей, {} сэмплов → {}/".format(
                 result["networks"], result["samples"], out_dir,
             ))
-        elif args.profile == "map":
-            out_path = args.out or "export/map_{}.html".format(_ts())
+        elif args.profile == "heatmap":
+            out_path = args.out or "export/heatmap_{}.html".format(_ts())
             try:
-                result = export_map_html(
+                result = export_heatmap_html(
                     conn, out_path, bssid_filter=bssid_filter,
-                    since=since, until=until, map_params=_map_params,
+                    since=since, until=until, heatmap_params=_heatmap_params,
                 )
-            except MapExportError as exc:
+            except HeatmapExportError as exc:
                 print("Карта не построена: {}".format(exc))
                 sys.exit(1)
             print("Построена карта: {} слоёв, {} замеров → {} ({:.1f} КБ)".format(
@@ -997,7 +1026,7 @@ if __name__ == "__main__":
 
             # heatmap принимает дополнительный аргумент bssid_filter (уже
             # разрешённый из --ssid выше либо взятый напрямую из --bssid)
-            if args.profile == "heatmap":
+            if args.profile == "csv":
                 count = fn(conn, out_path, bssid_filter=bssid_filter, since=since, until=until)
             else:
                 count = fn(conn, out_path, since=since, until=until)

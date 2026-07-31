@@ -1,4 +1,4 @@
-"""Тесты загрузки и валидации CSV (FR-1)."""
+"""Тесты загрузки и валидации CSV."""
 
 import pytest
 
@@ -97,7 +97,7 @@ def test_exact_duplicates_removed(csv_path):
 
 
 def test_duplicate_key_ignores_rssi(csv_path):
-    # bssid+timestamp+lat+lon совпадают, rssi разный — по FR-1 ключ дедупа не включает rssi
+    # bssid+timestamp+lat+lon совпадают, rssi разный — ключ дедупа не включает rssi
     rows = [
         "55.0,37.0,-70,AA:BB:CC:DD:EE:FF,Test,2026-07-21T16:49:48Z",
         "55.0,37.0,-71,AA:BB:CC:DD:EE:FF,Test,2026-07-21T16:49:48Z",

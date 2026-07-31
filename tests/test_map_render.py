@@ -1,4 +1,4 @@
-"""Тесты растеризации и сборки folium-карты (FR-5, FR-6)."""
+"""Тесты растеризации и сборки folium-карты."""
 
 import numpy as np
 import pandas as pd

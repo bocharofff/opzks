@@ -376,6 +376,39 @@ def format_adapters_table(adapters: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import sys
+
+    USAGE = """
+Список Wi-Fi адаптеров с их возможностями.
+
+  python3 -m src.adapters [-h|--help]
+
+Аргументов нет: выводит все найденные Wi-Fi интерфейсы и по каждому —
+интерфейс, MAC, драйвер/чипсет, поддержку monitor mode и USB-путь.
+
+Как это работает:
+  * Адаптеры ищутся в /sys/class/net; Wi-Fi определяется по наличию
+    подкаталога wireless или по ответу `iw dev <iface> info`.
+  * Monitor mode проверяется через `iw phy <phy> info` (секция «Supported
+    interface modes»), а если карта уже в мониторе — по `iwconfig`.
+  * Ничего не переключает и не меняет — только читает состояние системы,
+    поэтому root не обязателен (без него часть полей может быть «unknown»).
+  * MAC и USB-путь — стабильные идентификаторы: именно их стоит передавать
+    в `--monitor`/`--client` оркестратора, а не имя wlanN (оно может
+    поменяться после переподключения адаптера).
+
+Примеры:
+  # посмотреть, какие карты видны и какая из них умеет monitor mode
+  python3 -m src.adapters
+
+  # то же самое, но в составе оркестратора (единый rich-вывод)
+  sudo python3 -m src.cli --list
+""".strip()
+
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(USAGE)
+        sys.exit(0)
+
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

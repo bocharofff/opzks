@@ -1,4 +1,4 @@
-"""Растеризация сеток, сборка folium-карты со слоями и легендой (FR-5, FR-6)."""
+"""Растеризация сеток, сборка folium-карты со слоями и легендой."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def _add_title(m: folium.Map, title_text: str) -> None:
 def build_map(
     layers: list[NetworkLayer], *, render_params: RenderParams, title: str, show_points: bool = False
 ) -> folium.Map:
-    """Собирает folium-карту: по слою на сеть, легенда, LayerControl (FR-5, FR-6)."""
+    """Собирает folium-карту: по слою на сеть, легенда, переключатель слоёв."""
 
     all_bounds = [g.bounds for layer in layers for g in layer.grids]
     if not all_bounds:
