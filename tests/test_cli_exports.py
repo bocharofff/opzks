@@ -59,13 +59,13 @@ def export_dir(tmp_path, monkeypatch):
 
 
 def _heatmap_csv_path(export_dir):
-    files = [f for f in os.listdir(export_dir) if f.startswith("heatmap_") and f.endswith(".csv")]
+    files = [f for f in os.listdir(export_dir) if f.startswith("csv_") and f.endswith(".csv")]
     assert len(files) == 1
     return os.path.join(export_dir, files[0])
 
 
 def test_export_by_ssid_unique_resolves_to_bssid(db_path, export_dir):
-    cli.do_exports(db_path, ["heatmap"], bssid_filter=None, ssid_filter="NetA")
+    cli.do_exports(db_path, ["csv"], bssid_filter=None, ssid_filter="NetA")
 
     out_path = _heatmap_csv_path(export_dir)
     rows = _read_csv(out_path)
@@ -74,10 +74,10 @@ def test_export_by_ssid_unique_resolves_to_bssid(db_path, export_dir):
 
 
 def test_export_by_ssid_unknown_name_skips_heatmap(db_path, export_dir, caplog):
-    cli.do_exports(db_path, ["heatmap"], bssid_filter=None, ssid_filter="НетТакойСети")
+    cli.do_exports(db_path, ["csv"], bssid_filter=None, ssid_filter="НетТакойСети")
 
     # Профиль пропущен — файла heatmap_*.csv быть не должно
-    files = [f for f in os.listdir(export_dir) if f.startswith("heatmap_")]
+    files = [f for f in os.listdir(export_dir) if f.startswith("csv_")]
     assert files == []
     assert "не найдена" in caplog.text
 
@@ -89,10 +89,10 @@ def test_export_by_ssid_collision_skips_heatmap_but_not_others(db_path, export_d
     conn.commit()
     conn.close()
 
-    cli.do_exports(db_path, ["heatmap", "ap_status"], bssid_filter=None, ssid_filter="NetA")
+    cli.do_exports(db_path, ["csv", "ap_status"], bssid_filter=None, ssid_filter="NetA")
 
     # heatmap пропущен (нужна MAC для разрешения коллизии)
-    heatmap_files = [f for f in os.listdir(export_dir) if f.startswith("heatmap_")]
+    heatmap_files = [f for f in os.listdir(export_dir) if f.startswith("csv_")]
     assert heatmap_files == []
     assert "совпадает с 2 разными точками" in caplog.text
     assert NET_A["bssid"] in caplog.text
@@ -106,7 +106,7 @@ def test_export_by_ssid_collision_skips_heatmap_but_not_others(db_path, export_d
 def test_explicit_bssid_takes_priority_over_ssid(db_path, export_dir):
     # Если почему-то заданы оба — явный --export-bssid не переопределяется SSID
     cli.do_exports(
-        db_path, ["heatmap"], bssid_filter=NET_B["bssid"], ssid_filter="NetA",
+        db_path, ["csv"], bssid_filter=NET_B["bssid"], ssid_filter="NetA",
     )
     out_path = _heatmap_csv_path(export_dir)
     rows = _read_csv(out_path)
@@ -151,7 +151,7 @@ def test_do_exports_since_until_narrows_heatmap_to_one_day(db_path_multi_day, ex
     until = exporter.normalize_time_bound(DAY2, end_of_day=True)
 
     cli.do_exports(
-        db_path_multi_day, ["heatmap"], bssid_filter=None, ssid_filter=None,
+        db_path_multi_day, ["csv"], bssid_filter=None, ssid_filter=None,
         since=since, until=until,
     )
 
@@ -163,7 +163,7 @@ def test_do_exports_since_until_narrows_heatmap_to_one_day(db_path_multi_day, ex
 
 
 def test_do_exports_without_range_includes_all_days(db_path_multi_day, export_dir):
-    cli.do_exports(db_path_multi_day, ["heatmap"], bssid_filter=None, ssid_filter=None)
+    cli.do_exports(db_path_multi_day, ["csv"], bssid_filter=None, ssid_filter=None)
 
     out_path = _heatmap_csv_path(export_dir)
     rows = _read_csv(out_path)

@@ -13,7 +13,8 @@ data/*.db
 
 export/*.csv
 export/*.gpkg
-export/heatmap_networks_*/
+export/*.html
+export/csv_networks_*/
 
 # Если в корне случайно появятся файлы дампов или логов
 *.log

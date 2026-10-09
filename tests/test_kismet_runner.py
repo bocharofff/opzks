@@ -233,6 +233,6 @@ def test_sync_no_gps_marks_observation_without_coords(tmp_path):
         assert count == 1
         obs = conn.execute("SELECT lat, lon, has_gps FROM observations").fetchone()
         assert obs["lat"] is None and obs["lon"] is None
-        assert obs["has_gps"] == 0     # запись сохранена (ТЗ §8), но без координат
+        assert obs["has_gps"] == 0     # запись сохранена, но помечена как без координат
     finally:
         conn.close()

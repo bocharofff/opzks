@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-tests/test_exporter.py — форматы экспорта раздела 13 ТЗ.
+tests/test_exporter.py — форматы экспорта.
 
-Профили: heatmap (CSV), heatmap_networks (CSV на сеть + манифест),
+Профили: csv (сырые сэмплы), csv_networks (CSV на сеть + манифест),
 full (GeoPackage + CSV, оба файла всегда), wigle (WigleWifi-1.4), ap_status (CSV).
 """
 
@@ -123,7 +123,7 @@ def _seed_multi_day(conn):
 def test_heatmap_csv_header_and_gps_only(conn, tmp_path):
     _seed(conn)
     out = str(tmp_path / "heatmap.csv")
-    count = exporter.export_heatmap_csv(conn, out)
+    count = exporter.export_csv(conn, out)
 
     rows = _read_csv(out)
     assert rows[0] == ["lat", "lon", "rssi", "bssid", "ssid", "timestamp"]
@@ -134,7 +134,7 @@ def test_heatmap_csv_header_and_gps_only(conn, tmp_path):
 def test_heatmap_csv_bssid_filter(conn, tmp_path):
     _seed(conn)
     out = str(tmp_path / "heatmap_a.csv")
-    count = exporter.export_heatmap_csv(conn, out, bssid_filter=NET_A["bssid"])
+    count = exporter.export_csv(conn, out, bssid_filter=NET_A["bssid"])
 
     assert count == 2
     rows = _read_csv(out)
@@ -176,13 +176,13 @@ def test_resolve_bssid_by_ssid_collision(conn):
 
 
 # ---------------------------------------------------------------------------
-# heatmap_networks — тепловая карта ПО КАЖДОЙ СЕТИ
+# csv_networks — сырые сэмплы ПО КАЖДОЙ СЕТИ
 # ---------------------------------------------------------------------------
 
 def test_heatmap_per_network_one_file_per_network(conn, tmp_path):
     _seed(conn)
     out_dir = str(tmp_path / "heatmap_nets")
-    result = exporter.export_heatmap_per_network(conn, out_dir)
+    result = exporter.export_csv_per_network(conn, out_dir)
 
     assert result == {"networks": 2, "samples": 3}
 
@@ -206,7 +206,7 @@ def test_heatmap_per_network_one_file_per_network(conn, tmp_path):
 def test_heatmap_per_network_sanitizes_filenames(conn, tmp_path):
     _seed(conn)  # NetB Open — SSID с пробелом
     out_dir = str(tmp_path / "heatmap_nets2")
-    exporter.export_heatmap_per_network(conn, out_dir)
+    exporter.export_csv_per_network(conn, out_dir)
 
     files = [f for f in os.listdir(out_dir) if f != "_manifest.csv"]
     assert files
@@ -215,7 +215,7 @@ def test_heatmap_per_network_sanitizes_filenames(conn, tmp_path):
 
 def test_heatmap_per_network_empty_db(conn, tmp_path):
     out_dir = str(tmp_path / "heatmap_nets_empty")
-    result = exporter.export_heatmap_per_network(conn, out_dir)
+    result = exporter.export_csv_per_network(conn, out_dir)
     assert result == {"networks": 0, "samples": 0}
     assert os.path.exists(os.path.join(out_dir, "_manifest.csv"))
 
@@ -413,7 +413,7 @@ def test_heatmap_csv_since_until_selects_single_day(conn, tmp_path):
     _seed_multi_day(conn)
     since, until = _day_bounds(DAY2)
     out = str(tmp_path / "heatmap_day2.csv")
-    count = exporter.export_heatmap_csv(conn, out, since=since, until=until)
+    count = exporter.export_csv(conn, out, since=since, until=until)
 
     assert count == 2  # NetA (день2) + NetB (день2); NetC (только день1) исключён
     rows = _read_csv(out)
@@ -425,7 +425,7 @@ def test_heatmap_csv_since_until_combined_with_bssid_filter(conn, tmp_path):
     _seed_multi_day(conn)
     since, until = _day_bounds(DAY1)
     out = str(tmp_path / "heatmap_a_day1.csv")
-    count = exporter.export_heatmap_csv(
+    count = exporter.export_csv(
         conn, out, bssid_filter=NET_A["bssid"], since=since, until=until,
     )
     assert count == 2  # оба наблюдения NetA за день1; NetC отфильтрован по bssid
@@ -435,7 +435,7 @@ def test_heatmap_per_network_since_until(conn, tmp_path):
     _seed_multi_day(conn)
     since, until = _day_bounds(DAY2)
     out_dir = str(tmp_path / "heatmap_nets_day2")
-    result = exporter.export_heatmap_per_network(conn, out_dir, since=since, until=until)
+    result = exporter.export_csv_per_network(conn, out_dir, since=since, until=until)
 
     assert result == {"networks": 2, "samples": 2}  # NetC (день1) не входит
     manifest = _read_csv(os.path.join(out_dir, "_manifest.csv"))
